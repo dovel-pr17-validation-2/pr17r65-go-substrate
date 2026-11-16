@@ -1,0 +1,57 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package userclass
+
+import (
+	"net/http"
+	"time"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/dynconfig"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Config holds the dependencies a user class needs. Built once at startup
+// and passed to the entry's Init func.
+type Config struct {
+	// APIStub is the shared gRPC client to ateapi (one connection, all goroutines).
+	APIStub ateapi.ControlClient
+	// HTTPClient is the shared HTTP client for atenet pings.
+	HTTPClient *http.Client
+	// RouterURL is the base URL of the atenet router (no trailing slash).
+	RouterURL string
+	// Atespace every actor this worker creates lives in. Required; caller
+	// is responsible for having ensured it exists (see EnsureAtespace).
+	Atespace string
+	// Dyn is the runtime-mutable config, built from the class's
+	// Entry.Config codec. Required: a class reads its typed knobs from it
+	// through dynconfig.Get on every iteration, so tests can swap the
+	// holder without touching class internals.
+	Dyn *dynconfig.Holder
+	// Tracer anchors sampled spans; falls back to the otel global if nil.
+	Tracer trace.Tracer
+	// ActorsPerUser is the number of actors each VU creates on startup and
+	// cycles through in round-robin (iteration i targets actor
+	// i%ActorsPerUser). Zero or negative is treated as 1 by user classes
+	// that honor this knob; classes that don't honor it treat every VU as
+	// owning exactly one actor.
+	ActorsPerUser int
+	// TotalActors is the total number of actors to create in the batch (spawn benchmark).
+	TotalActors int
+	// SpawnConcurrency is the number of actors created concurrently (spawn benchmark).
+	SpawnConcurrency int
+	// ActorDeadline is the per-actor timeout covering CreateActor + ResumeActor + Ping (spawn benchmark).
+	ActorDeadline time.Duration
+}

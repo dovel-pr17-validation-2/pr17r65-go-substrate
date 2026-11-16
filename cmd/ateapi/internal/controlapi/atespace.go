@@ -1,0 +1,133 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controlapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/apivalidation"
+	"go.ate.dev/substrate/cmd/ateapi/internal/defaults"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+func (s *RPCService) CreateAtespace(ctx context.Context, req *ateapi.CreateAtespaceRequest) (*ateapi.Atespace, error) {
+	// First scrub any fields that users are not allowed to set, then fill the
+	// defaults so validation sees the final resource state.
+	inAtespace := req.GetAtespace()
+	if inAtespace != nil { // otherwise validation will flag it
+		scrubResourceMetadataForCreate(inAtespace.Metadata)
+		// no status field, but if there were, we would scrub it here
+		defaults.Apply(inAtespace)
+	}
+
+	// Validate the request, including the object within it.
+	if errs := apivalidation.ValidateCreateAtespaceRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+
+	// Handle the creation, including validation of the final stored object.
+	return s.impl.CreateAtespace(ctx, inAtespace)
+}
+
+func (s *ServiceImpl) CreateAtespace(ctx context.Context, inAtespace *ateapi.Atespace) (*ateapi.Atespace, error) {
+	// no further processing or status, but if there were, we would do it here
+
+	// Save the data in the storage layer.
+	stored, err := s.store.CreateAtespace(ctx, inAtespace)
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil, apierror.AlreadyExists("Atespace %s already exists", inAtespace.Metadata.Name)
+		}
+		return nil, fmt.Errorf("while recording atespace: %w", err)
+	}
+
+	return stored, nil
+}
+
+func (s *RPCService) GetAtespace(ctx context.Context, req *ateapi.GetAtespaceRequest) (*ateapi.Atespace, error) {
+	if errs := apivalidation.ValidateGetAtespaceRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+
+	return s.impl.GetAtespace(ctx, req.Atespace.Name)
+}
+
+func (s *ServiceImpl) GetAtespace(ctx context.Context, name string) (*ateapi.Atespace, error) {
+	atespace, err := s.store.GetAtespace(ctx, name)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, apierror.NotFound("Atespace %s not found", name)
+	} else if err != nil {
+		return nil, fmt.Errorf("while getting atespace from DB: %w", err)
+	}
+
+	return atespace, nil
+}
+
+func (s *RPCService) ListAtespaces(ctx context.Context, req *ateapi.ListAtespacesRequest) (*ateapi.ListAtespacesResponse, error) {
+	if errs := apivalidation.ValidateListAtespacesRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+
+	page, err := s.impl.ListAtespaces(ctx, toStoreListOptions(req.GetOptions()))
+	if err != nil {
+		return nil, err
+	}
+	return &ateapi.ListAtespacesResponse{
+		Atespaces:     page.Items,
+		NextPageToken: page.NextPageToken,
+	}, nil
+}
+
+func (s *ServiceImpl) ListAtespaces(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapi.Atespace], error) {
+	page, err := s.store.ListAtespaces(ctx, opts)
+	if err != nil {
+		return page, mapListError(fmt.Errorf("while listing atespaces in db: %w", err))
+	}
+	return page, nil
+}
+
+func (s *RPCService) DeleteAtespace(ctx context.Context, req *ateapi.DeleteAtespaceRequest) (*ateapi.Atespace, error) {
+	if errs := apivalidation.ValidateDeleteAtespaceRequest(ctx, req); len(errs) > 0 {
+		return nil, resources.ToAPIError(errs)
+	}
+
+	return s.impl.DeleteAtespace(ctx, req.Atespace.Name, toDeletePreconditions(req.GetOptions()))
+}
+
+func (s *ServiceImpl) DeleteAtespace(ctx context.Context, name string, precondition store.DeletePreconditions) (*ateapi.Atespace, error) {
+	deleted, err := s.store.DeleteAtespace(ctx, name, precondition)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, apierror.NotFound("Atespace %s not found", name)
+		}
+		if errors.Is(err, store.ErrFailedPrecondition) {
+			return nil, apierror.FailedPrecondition("Atespace %s is not empty", name)
+		}
+		if errors.Is(err, store.ErrUIDConflict) {
+			return nil, apierror.Aborted("Atespace %s does not have uid %s", name, precondition.UID)
+		}
+		if errors.Is(err, store.ErrVersionConflict) {
+			return nil, apierror.Aborted("concurrent update conflict, please retry")
+		}
+		return nil, fmt.Errorf("while deleting atespace from DB: %w", err)
+	}
+
+	return deleted, nil
+}

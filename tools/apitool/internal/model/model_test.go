@@ -1,0 +1,663 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package model_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/tools/apitool/internal/model"
+)
+
+func buildAPI(t *testing.T, protoBody string) *model.API {
+	t.Helper()
+	protoText := "syntax = \"proto3\";\npackage fixture;\n\n" + protoBody
+	api, err := model.Build(t.Context(), protoText)
+	if err != nil {
+		t.Fatalf("compiling fixture: %v", err)
+	}
+	return api
+}
+
+func TestBuild_MapField(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  map<string, string> labels = 1;
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "labels", Number: 1, Kind: protoreflect.MessageKind, TypeDisplay: "map<string, string>", MapValueKind: protoreflect.StringKind},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_RepeatedMessageField(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  repeated Gadget gadgets = 1;
+}
+
+message Gadget {
+  string id = 1;
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "gadgets", Number: 1, Repeated: true, TypeDisplay: "repeated Gadget", TypeFullName: "fixture.Gadget", Kind: protoreflect.MessageKind},
+			}},
+			{FullName: "fixture.Gadget", Name: "Gadget", Fields: []model.Field{
+				{Name: "id", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string"},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_MapValueMessageField(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  map<string, Gadget> gadgets_by_id = 1;
+}
+
+message Gadget {
+  string id = 1;
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "gadgets_by_id", Number: 1, Kind: protoreflect.MessageKind, TypeDisplay: "map<string, Gadget>", MapValueFullName: "fixture.Gadget", MapValueKind: protoreflect.MessageKind},
+			}},
+			{FullName: "fixture.Gadget", Name: "Gadget", Fields: []model.Field{
+				{Name: "id", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string"},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_Oneof(t *testing.T) {
+	got := buildAPI(t, `
+message Ref {
+  oneof reference {
+    string snapshot = 1;
+    string tag = 2;
+  }
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Ref", Name: "Ref", Fields: []model.Field{
+				{Name: "snapshot", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string", OneofName: "reference"},
+				{Name: "tag", Number: 2, Kind: protoreflect.StringKind, TypeDisplay: "string", OneofName: "reference"},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_NestedEnums(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  Status status = 1;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACTIVE = 1;
+  }
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "status", Number: 1, TypeDisplay: "Widget.Status", TypeFullName: "fixture.Widget.Status", Kind: protoreflect.EnumKind},
+			}},
+		},
+		Enums: []model.Enum{
+			{
+				FullName: "fixture.Widget.Status", Name: "Widget.Status", ParentFullName: "fixture.Widget",
+				Values: []model.EnumValue{
+					{Name: "STATUS_UNSPECIFIED", Number: 0},
+					{Name: "STATUS_ACTIVE", Number: 1},
+				},
+			},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_Comments(t *testing.T) {
+	got := buildAPI(t, `
+// Widget's doc comment.
+message Widget {
+  // name's doc comment.
+  string name = 1;
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{
+				FullName: "fixture.Widget", Name: "Widget", Comment: "Widget's doc comment.",
+				Fields: []model.Field{
+					{Name: "name", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string", Comment: "name's doc comment."},
+				},
+			},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_Proto3Optional(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  optional string nickname = 1;
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "nickname", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string", Proto3Optional: true},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_DebugRedact(t *testing.T) {
+	got := buildAPI(t, `
+message Widget {
+  string token = 1 [debug_redact = true];
+}
+`)
+
+	want := &model.API{
+		Messages: []model.Message{
+			{FullName: "fixture.Widget", Name: "Widget", Fields: []model.Field{
+				{Name: "token", Number: 1, Kind: protoreflect.StringKind, TypeDisplay: "string", Redacted: true},
+			}},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("API mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestBuild_Annotations(t *testing.T) {
+	api, err := model.Build(t.Context(), ateapi.Source)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	gotResources := map[string]*model.ResourceAnnotation{}
+	for _, m := range api.Messages {
+		if m.IsResource() {
+			gotResources[m.Name] = m.ResourceAnnotation
+		}
+	}
+	wantResources := map[string]*model.ResourceAnnotation{
+		"Actor":           {Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"},
+		"EgressPolicy":    {Parents: []string{"Actor"}, Singleton: true, Plural: "EgressPolicies"},
+		"Tag":             {Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Tags"},
+		"Atespace":        {Scope: ateapi.Scope_SCOPE_GLOBAL, Plural: "Atespaces"},
+		"ActorTemplate":   {Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "ActorTemplates"},
+		"Worker":          {Scope: ateapi.Scope_SCOPE_GLOBAL, Plural: "Workers"},
+		"ActorAssignment": {Parents: []string{"Worker"}, Plural: "ActorAssignments"},
+		"AccessPolicy":    {Parents: []string{"Global", "Atespace"}, Singleton: true, Plural: "AccessPolicies"},
+	}
+	if diff := cmp.Diff(wantResources, gotResources); diff != "" {
+		t.Errorf("resource annotations mismatch (-want +got):\n%s", diff)
+	}
+
+	wantMethods := map[protoreflect.Name]string{
+		"GetActor":                   "Actor",
+		"SuspendActor":               "Actor",
+		"GetActorEgressPolicy":       "EgressPolicy",
+		"GetGlobalAccessPolicy":      "AccessPolicy",
+		"GetAtespaceAccessPolicy":    "AccessPolicy",
+		"ListWorkerActorAssignments": "ActorAssignment",
+	}
+	gotMethods := map[protoreflect.Name]string{}
+	for _, svc := range api.Services {
+		for _, m := range svc.Methods {
+			if _, ok := wantMethods[m.Name]; ok {
+				gotMethods[m.Name] = m.Resource
+			}
+		}
+	}
+	if diff := cmp.Diff(wantMethods, gotMethods); diff != "" {
+		t.Errorf("method annotations mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// Older releases declare the annotations in another package, so Build can't
+// look them up in this binary's descriptors.
+func TestBuild_AnnotationsInOtherPackage(t *testing.T) {
+	got := buildAPI(t, `
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.MessageOptions {
+  ResourceAnnotation resource = 50000;
+}
+extend google.protobuf.MethodOptions {
+  MethodAnnotation method = 50000;
+}
+message ResourceAnnotation {
+  repeated string parents = 1;
+  bool singleton = 2;
+  Scope scope = 3;
+  string plural = 4;
+}
+message MethodAnnotation {
+  string resource = 1;
+}
+enum Scope {
+  SCOPE_UNSPECIFIED = 0;
+  SCOPE_ATESPACE = 1;
+}
+
+service Svc {
+  rpc GetWidget(Widget) returns (Widget) {
+    option (method).resource = "Widget";
+  }
+}
+message Widget {
+  option (resource) = {
+    scope: SCOPE_ATESPACE
+    plural: "Widgets"
+  };
+}
+`)
+
+	var gotResource *model.ResourceAnnotation
+	for _, m := range got.Messages {
+		if m.Name == "Widget" {
+			gotResource = m.ResourceAnnotation
+		}
+	}
+	wantResource := &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Widgets"}
+	if diff := cmp.Diff(wantResource, gotResource); diff != "" {
+		t.Errorf("Widget annotation mismatch (-want +got):\n%s", diff)
+	}
+	if got := got.Services[0].Methods[0].Resource; got != "Widget" {
+		t.Errorf("GetWidget resource = %q, want %q", got, "Widget")
+	}
+}
+
+func TestBuild_UnknownAnnotation(t *testing.T) {
+	for _, tc := range []struct {
+		name, extensionNumber, pluralNumber string
+	}{
+		{name: "renumbered extension", extensionNumber: "50001", pluralNumber: "4"},
+		{name: "renumbered annotation field", extensionNumber: "50000", pluralNumber: "5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := `syntax = "proto3";
+package fixture;
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.MessageOptions {
+  ResourceAnnotation resource = ` + tc.extensionNumber + `;
+}
+message ResourceAnnotation {
+  string plural = ` + tc.pluralNumber + `;
+}
+message Widget {
+  option (resource).plural = "Widgets";
+}
+`
+			if _, err := model.Build(t.Context(), source); err == nil {
+				t.Error("Build() error = nil, want an error for the annotation this binary can't read")
+			}
+		})
+	}
+}
+
+func TestResources(t *testing.T) {
+	api := &model.API{
+		Services: []model.Service{{
+			Name: "Control",
+			Methods: []model.Method{
+				{Name: "GetActor", ServiceName: "Control", Resource: "Actor"},
+				{Name: "GetWorker", ServiceName: "Control", Resource: "Worker"},
+				{Name: "SuspendActor", ServiceName: "Control", Resource: "Actor"},
+			},
+		}},
+		Messages: []model.Message{
+			{FullName: "test.GetActorRequest", Name: "GetActorRequest"},
+			{FullName: "test.Worker", Name: "Worker", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_GLOBAL, Plural: "Workers"}},
+			{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"}},
+			{FullName: "test.EgressPolicy", Name: "EgressPolicy", ResourceAnnotation: &model.ResourceAnnotation{Parents: []string{"Global", "Actor"}, Plural: "EgressPolicies"}},
+		},
+	}
+
+	groups, err := model.Resources(api)
+	if err != nil {
+		t.Fatalf("Resources() error = %v", err)
+	}
+
+	got := map[string][]protoreflect.Name{}
+	var gotOrder []string
+	for _, g := range groups {
+		gotOrder = append(gotOrder, g.Message.Name)
+		got[g.Message.Name] = []protoreflect.Name{}
+		for _, m := range g.Methods {
+			got[g.Message.Name] = append(got[g.Message.Name], m.Name)
+		}
+	}
+	if diff := cmp.Diff([]string{"Worker", "Actor", "EgressPolicy"}, gotOrder); diff != "" {
+		t.Errorf("resource order mismatch (-want +got):\n%s", diff)
+	}
+	want := map[string][]protoreflect.Name{
+		"Worker":       {"GetWorker"},
+		"Actor":        {"GetActor", "SuspendActor"},
+		"EgressPolicy": {},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("methods by resource mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestResources_Invalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		api     *model.API
+		wantErr string
+	}{
+		{
+			name: "method without annotation",
+			api: &model.API{
+				Services: []model.Service{{Name: "Control", Methods: []model.Method{{Name: "GetActor"}}}},
+				Messages: []model.Message{{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"}}},
+			},
+			wantErr: "Control.GetActor: no resource annotation",
+		},
+		{
+			name: "method annotated with a message that isn't a resource",
+			api: &model.API{
+				Services: []model.Service{{Name: "Control", Methods: []model.Method{{Name: "GetActor", Resource: "Actor"}}}},
+				Messages: []model.Message{{FullName: "test.Actor", Name: "Actor"}},
+			},
+			wantErr: `annotated resource "Actor" is not a resource in this API`,
+		},
+		{
+			name: "method annotated with an unknown resource",
+			api: &model.API{
+				Services: []model.Service{{Name: "Control", Methods: []model.Method{{Name: "GetActor", Resource: "Actor"}}}},
+			},
+			wantErr: `annotated resource "Actor" is not a resource in this API`,
+		},
+		{
+			name: "unknown parent",
+			api: &model.API{
+				Messages: []model.Message{
+					{FullName: "test.EgressPolicy", Name: "EgressPolicy", ResourceAnnotation: &model.ResourceAnnotation{Parents: []string{"Actor"}, Plural: "EgressPolicies"}},
+				},
+			},
+			wantErr: `test.EgressPolicy: parent "Actor" is neither "Global" nor a resource in this API`,
+		},
+		{
+			name: "resource without plural",
+			api: &model.API{
+				Messages: []model.Message{{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE}}},
+			},
+			wantErr: "test.Actor: resource has no plural",
+		},
+		{
+			name: "top-level resource without scope",
+			api: &model.API{
+				Messages: []model.Message{{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Plural: "Actors"}}},
+			},
+			wantErr: "test.Actor: top-level resource has no scope",
+		},
+		{
+			name: "subresource with scope",
+			api: &model.API{
+				Messages: []model.Message{
+					{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"}},
+					{FullName: "test.EgressPolicy", Name: "EgressPolicy", ResourceAnnotation: &model.ResourceAnnotation{Parents: []string{"Actor"}, Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "EgressPolicies"}},
+				},
+			},
+			wantErr: "test.EgressPolicy: subresource has scope SCOPE_ATESPACE",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := model.Resources(tt.api)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Resources() error = %v, want one containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseStandardMethod(t *testing.T) {
+	actor := model.Message{Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"}}
+	accessPolicy := model.Message{Name: "AccessPolicy", ResourceAnnotation: &model.ResourceAnnotation{Parents: []string{"Global", "Atespace"}, Plural: "AccessPolicies"}}
+	tests := []struct {
+		name       string
+		methodName protoreflect.Name
+		resource   model.Message
+		wantVerb   model.Verb
+		wantParent string
+		wantOK     bool
+	}{
+		{name: "top-level get", methodName: "GetActor", resource: actor, wantVerb: model.VerbGet, wantOK: true},
+		{name: "top-level list by plural", methodName: "ListActors", resource: actor, wantVerb: model.VerbList, wantOK: true},
+		{name: "list by singular", methodName: "ListActor", resource: actor},
+		{name: "subresource get", methodName: "GetAtespaceAccessPolicy", resource: accessPolicy, wantVerb: model.VerbGet, wantParent: "Atespace", wantOK: true},
+		{name: "subresource list", methodName: "ListGlobalAccessPolicies", resource: accessPolicy, wantVerb: model.VerbList, wantParent: "Global", wantOK: true},
+		{name: "subresource without its parent", methodName: "GetAccessPolicy", resource: accessPolicy},
+		{name: "custom method", methodName: "SuspendActor", resource: actor},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, parent, ok := model.ParseStandardMethod(tc.methodName, tc.resource)
+			if v != tc.wantVerb || parent != tc.wantParent || ok != tc.wantOK {
+				t.Errorf("ParseStandardMethod(%q) = (%q, %q, %t), want (%q, %q, %t)", tc.methodName, v, parent, ok, tc.wantVerb, tc.wantParent, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestScopeToService(t *testing.T) {
+	control := model.Service{Name: "Control", Methods: []model.Method{
+		{Name: "GetActorEgressPolicy", ServiceName: "Control", InputName: "test.GetActorEgressPolicyRequest", OutputName: "test.EgressPolicy", Resource: "EgressPolicy"},
+	}}
+	actor := model.Message{FullName: "test.Actor", Name: "Actor", ResourceAnnotation: &model.ResourceAnnotation{Scope: ateapi.Scope_SCOPE_ATESPACE, Plural: "Actors"}}
+	egressPolicy := model.Message{FullName: "test.EgressPolicy", Name: "EgressPolicy", ResourceAnnotation: &model.ResourceAnnotation{Parents: []string{"Global", "Actor"}, Plural: "EgressPolicies"}}
+	request := model.Message{FullName: "test.GetActorEgressPolicyRequest", Name: "GetActorEgressPolicyRequest"}
+	unused := model.Message{FullName: "test.Unused", Name: "Unused"}
+	api := &model.API{
+		Services: []model.Service{control, {Name: "Other"}},
+		Messages: []model.Message{actor, unused, egressPolicy, request},
+	}
+
+	got := model.ScopeToService(api, "Control")
+
+	want := &model.API{
+		Services: []model.Service{control},
+		Messages: []model.Message{actor, egressPolicy, request},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("ScopeToService() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestPublicDoc(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+		want    string
+	}{
+		{
+			name:    "no directives",
+			comment: "atespace is the namespace the resource belongs to.",
+			want:    "atespace is the namespace the resource belongs to.",
+		},
+		{
+			name: "trailing directives are removed",
+			comment: "atespace is the namespace the resource belongs to.\n" +
+				"\n" +
+				"+k8s:optional\n" +
+				"+k8s:format=k8s-short-name\n" +
+				"+k8s:immutable",
+			want: "atespace is the namespace the resource belongs to.",
+		},
+		{
+			name: "directive with a trailing comment is removed whole",
+			comment: "content_scope is what the snapshot captured.\n" +
+				"\n" +
+				"+k8s:optional\n" +
+				"+k8s:minimum=1\n" +
+				"+k8s:maximum=2 # keep this in sync with the SnapshotContentScope enum",
+			want: "content_scope is what the snapshot captured.",
+		},
+		{
+			name: "ate directives are removed",
+			comment: "volumes are the actor's volumes.\n" +
+				"\n" +
+				"+ate:preview=ExternalVolumes\n" +
+				"+k8s:optional",
+			want: "volumes are the actor's volumes.",
+		},
+		{
+			name: "prose merely mentioning +k8s: is kept",
+			comment: "Atespaced resources should add `+k8s:subfield(atespace)=+k8s:required`\n" +
+				"Non-atespaced resources should add `+k8s:subfield(atespace)=+k8s:forbidden`\n" +
+				"+k8s:optional",
+			want: "Atespaced resources should add `+k8s:subfield(atespace)=+k8s:required`\n" +
+				"Non-atespaced resources should add `+k8s:subfield(atespace)=+k8s:forbidden`",
+		},
+		{
+			name: "indented directive is still recognized",
+			comment: "field does X.\n" +
+				"  +k8s:optional",
+			want: "field does X.",
+		},
+		{
+			name:    "only directives leaves an empty comment",
+			comment: "+k8s:optional\n+k8s:immutable",
+			want:    "",
+		},
+		{
+			name:    "empty comment stays empty",
+			comment: "",
+			want:    "",
+		},
+		{
+			name: "removed directives collapse surrounding blank lines to one",
+			comment: "First paragraph.\n" +
+				"\n" +
+				"+k8s:optional\n" +
+				"\n" +
+				"Second paragraph.",
+			want: "First paragraph.\n\nSecond paragraph.",
+		},
+		{
+			name:    "internal note on its own lines is removed",
+			comment: "First paragraph.\n\n(-- An internal\nnote. --)\n\nSecond paragraph.",
+			want:    "First paragraph.\n\nSecond paragraph.",
+		},
+		{
+			name:    "internal note inside a paragraph is removed",
+			comment: "Bounded at 64. (-- A guardrail. --)\n\n+k8s:maxProperties=64",
+			want:    "Bounded at 64.",
+		},
+		{
+			name:    "unclosed internal note is kept",
+			comment: "First paragraph. (-- unclosed",
+			want:    "First paragraph. (-- unclosed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := model.PublicDoc(tt.comment); got != tt.want {
+				t.Errorf("PublicDoc(%q) = %q, want %q", tt.comment, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSummary(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+		want    string
+	}{
+		{
+			name:    "one paragraph",
+			comment: "Get an Actor.",
+			want:    "Get an Actor.",
+		},
+		{
+			name:    "first paragraph spanning lines",
+			comment: "Suspend an actor\nto a new snapshot.\n\nA running actor is checkpointed.",
+			want:    "Suspend an actor\nto a new snapshot.",
+		},
+		{
+			name:    "paragraphs split by a whitespace-only line",
+			comment: "Summary.\n \nDetails.",
+			want:    "Summary.",
+		},
+		{
+			name:    "internal notes and directives are not part of it",
+			comment: "(-- Internal. --)\nSummary.\n\n+k8s:optional",
+			want:    "Summary.",
+		},
+		{
+			name:    "empty comment",
+			comment: "",
+			want:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := model.Summary(tt.comment); got != tt.want {
+				t.Errorf("Summary(%q) = %q, want %q", tt.comment, got, tt.want)
+			}
+		})
+	}
+}

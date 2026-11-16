@@ -1,0 +1,181 @@
+# Substrate benchmark automation
+
+Scheduled, repeatable benchmark runs of a substrate branch. A CronJob on an
+**orchestration cluster** drives the full build/deploy/run/teardown cycle
+against a separate **test cluster**, once per entry in [tests.yaml](tests.yaml).
+Each run uploads results to GCS via `benchmarking/locust/runner.py`
+(`type: locust`) or `benchmarking/nighthawk-ingress/runner.py` (`type: nighthawk-ingress`,
+the router capacity benchmark — see
+[benchmarking/nighthawk-ingress/README.md](../nighthawk-ingress/README.md)).
+To run the cold resume tests from your workstation instead, see
+[ateapi-cold-resume.md](ateapi-cold-resume.md).
+
+## How it works
+
+1. CronJob fires on the orchestration cluster; pod starts (orchestrator +
+   DIND sidecar).
+2. Orchestrator waits for DIND, copies the appropriate `ate-dev-env.sh`, runs
+   `gcloud container clusters get-credentials` for the test cluster.
+3. Shallow-clones `--repo` at `--branch`, captures the commit hash.
+4. `docker build && docker push` builds the runner image for each test type
+   in use, tagged with the commit hash: `${KO_DOCKER_REPO}/locust-test:<commit>`
+   and/or `${KO_DOCKER_REPO}/nighthawk-ingress-test:<commit>`.
+5. `go run ./cmd/ate-setup deploy ate-system` (with `ATE_CREDENTIAL_PROVIDER`
+   in `.ate-dev-env.sh`, or `--credential-provider` in the test's
+   `ateArgs`; passes `--sandbox-classes=<class>` so `deploy ate-system`
+   installs the test's class and, for `microvm`, stages the microVM guest
+   assets to `<BUCKET_NAME>-assets` and applies the cluster-wide `microvm`
+   `SandboxConfig`) + `benchmarking/workloads/deploy.sh
+   --deploy --sandbox-class <class>` (these build & push substrate / workload
+   images via `ko` as part of their deploy steps — there's no separate
+   image build step). The install sets `ATE_API_AUTHZ_BOOTSTRAP_OWNERS` to
+   the `ate-client` and `benchmarking/benchmark-runner` ServiceAccounts so the
+   runner's calls pass [authorization](../../docs/guides/authorization.md), and sets
+   `ATE_INGRESS_ALLOWED_SPIFFE_IDS` to `benchmarking/benchmark-runner` for the
+   Envoy ingress router.
+   For a `nighthawk-ingress` test the orchestrator additionally patches the
+   `atenet-router` Deployment right after `deploy_substrate`: `envoyCpu`
+   is the benchmark's independent variable and the shipped manifest sets
+   no cpu resources or `--concurrency`, so each test pins cpu
+   requests=limits and Envoy's thread count to its own `envoyCpu`, then
+   waits for the rollout before deploying workloads. The teardown after
+   each test redeploys substrate, so the pin never outlives its run.
+6. For each test in `tests.yaml`, or only those named by `--test-name`:
+   - Submits a Job using the just-built image for the test's type
+     (`runner-job.yaml.tmpl` for locust,
+     `nighthawk-ingress-runner-job.yaml.tmpl` for nighthawk-ingress).
+     A locust Job also gets `--metadata` with the target cluster's name,
+     location and project, merged with the `BENCHMARK_METADATA` environment
+     variable (a JSON object) if set. A `--metadata` in the test's own
+     `flags` is merged in too, its keys winning on conflict.
+   - Polls until complete/failed/timeout; tails logs; deletes the Job.
+   - Tears down workloads + substrate.
+   - If not the last test, redeploys them so the next run starts clean.
+
+## Choosing a sandbox class
+
+Each entry in `tests.yaml` may set `sandboxClass: gvisor | microvm` (default
+`gvisor`). This controls both `spec.sandboxClasses[0].name` on the benchmark WorkerPool
+and its `workerImage` (`ateworker-gvisor` vs `ateworker-microvm`).
+
+For `microvm` tests the target cluster must have KVM-capable nodes. The
+orchestrator uploads the microVM assets, so its Workload Identity principal
+must be able to write to the bucket they go to. On GKE that is
+`<BUCKET_NAME>-assets`, where `BUCKET_NAME` comes from `.ate-dev-env.sh`.
+
+## Setup
+
+```bash
+./benchmarking/automation/setup.sh
+```
+
+The wizard treats the repo's `.ate-dev-env.sh` as the source of truth for the
+target cluster's environment and snapshots it to
+`scratch/target-clusters/<name>.sh`. It only prompts for the target cluster
+name (the routing key in `tests.yaml`) and the GCP project ID of the
+orchestrator image registry. It then builds + pushes the orchestrator image
+to `gcr.io/<ORCH_PROJECT_ID>/ate-images/substrate-benchmark-orchestrator:<short-commit>`
+(with a `-dirty` suffix if `benchmarking/automation/` has uncommitted
+changes) and renders `scratch/cronjob.yaml`, `scratch/test-list.yaml`, and
+`scratch/target-clusters.yaml`. You can edit the `.ate-dev-env.sh` for your
+workload cluster directly in the config map. 
+
+Then edit the `--repo / --branch / --dest` args in `scratch/cronjob.yaml` and
+apply:
+
+```bash
+kubectl --context=<orchestration-cluster> apply -f scratch/cronjob.yaml
+```
+
+To trigger immediately instead of waiting for the schedule:
+
+```bash
+kubectl --context=<orchestration-cluster> -n substrate-benchmark \
+  create job --from=cronjob/substrate-benchmark manual-$(date +%s)
+```
+
+To change the schedule, edit `spec.schedule` in `scratch/cronjob.yaml` (the
+default is `0 3 * * *`, 3am UTC).
+
+## Test cluster prerequisites
+
+Create the test cluster with the substrate-required beta APIs, Workload
+Identity, and Managed OpenTelemetry enabled. The control plane must be on
+Kubernetes 1.36+. Substrate discovers PodCertificateRequest and
+ClusterTrustBundle independently, preferring `certificates.k8s.io/v1` for each
+and using `v1beta1` when the stable resource is not served. On GKE 1.36,
+enable both beta APIs at cluster creation:
+
+```bash
+gcloud container clusters create <CLUSTER_NAME> \
+  --location=<CLUSTER_LOCATION> \
+  --num-nodes=5 \
+  --workload-pool=<PROJECT_ID>.svc.id.goog \
+  --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
+  --enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles
+```
+
+On GKE 1.37 or higher, omit `--enable-kubernetes-unstable-apis`; the
+required APIs are served by default. See the [cluster setup guide](https://github.com/ai-on-gke/substrate-gke/blob/main/tools/setup-gcp/README.md#2-create-cluster) in substrate-gke for details.
+
+The orchestration cluster needs Workload Identity but no special APIs. It only
+ever runs one pod (the orchestrator + DIND sidecar), so a single zonal node
+keeps costs to the minimum:
+
+```bash
+gcloud container clusters create <ORCH_CLUSTER_NAME> \
+  --location=<ORCH_ZONE> \
+  --workload-pool=<ORCH_PROJECT_ID>.svc.id.goog \
+  --num-nodes=1
+```
+
+## IAM prerequisites
+
+This setup assumes both clusters and the destination GCS bucket already exist.
+Two Workload Identity bindings are needed.
+
+Both ServiceAccounts are created by the manifests (`cronjob.yaml` for the
+orchestrator KSA, `runner-job.yaml.tmpl` for the runner KSA — applied by
+`orchestrator.py` at runtime), so no `kubectl create serviceaccount` steps are
+needed. Grant IAM roles directly to each KSA's Workload Identity principal
+(no GSA / annotation required). The principal format is:
+
+```
+principal://iam.googleapis.com/projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<PROJECT_ID>.svc.id.goog/subject/ns/<NAMESPACE>/sa/<KSA>
+```
+
+**Orchestrator pod** (KSA `substrate-benchmark-orchestrator` in namespace
+`substrate-benchmark` on the orchestration cluster's project) needs:
+
+- `roles/container.admin` on the test cluster's project — required to manage
+  cluster-scoped resources (CRDs, ClusterRoles, ClusterRoleBindings,
+  Namespaces) that `ate-setup deploy ate-system` creates.
+  `container.developer` is not enough — it intentionally omits the
+  `container.clusterRoles.*` and `container.customResourceDefinitions.*`
+  permissions.
+- `roles/artifactregistry.writer` on `KO_DOCKER_REPO` — for `ko` (substrate
+  images) and `docker push` (locust image).
+
+```bash
+ORCH_PRINCIPAL="principal://iam.googleapis.com/projects/<ORCH_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<ORCH_PROJECT_ID>.svc.id.goog/subject/ns/substrate-benchmark/sa/substrate-benchmark-orchestrator"
+gcloud projects add-iam-policy-binding <TEST_PROJECT_ID> \
+  --role=roles/container.admin --member="${ORCH_PRINCIPAL}"
+gcloud projects add-iam-policy-binding <TEST_PROJECT_ID> \
+  --role=roles/artifactregistry.writer --member="${ORCH_PRINCIPAL}"
+```
+
+**Runner Job pod** (KSA `benchmark-runner` in namespace `benchmarking` on the
+test cluster's project) needs `roles/storage.objectUser` on the destination
+bucket so `runner.py` can upload results:
+
+```bash
+RUNNER_PRINCIPAL="principal://iam.googleapis.com/projects/<TEST_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<TEST_PROJECT_ID>.svc.id.goog/subject/ns/benchmarking/sa/benchmark-runner"
+gcloud storage buckets add-iam-policy-binding gs://<DEST_BUCKET> \
+  --role=roles/storage.objectCreator --member="${RUNNER_PRINCIPAL}"
+```
+
+## Updating tests
+
+`tests.yaml` is delivered to the orchestrator via a ConfigMap mounted at
+`/etc/orchestrator/tests.yaml`, so the image doesn't need to be rebuilt when
+the test list changes. Just reapply the config map.

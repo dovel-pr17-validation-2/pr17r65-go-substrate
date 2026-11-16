@@ -1,0 +1,115 @@
+//  Copyright 2026 The Agent Substrate Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
+package extproc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"go.ate.dev/substrate/internal/ateattr"
+)
+
+// atenet.router.route.duration measures the latency from when the ext_proc handler receives a request
+// (dataplane -> EPP) until the target worker endpoint is resolved
+const routeDurationMetricName = "atenet.router.route.duration"
+
+// NewRouteDurationHistogram creates the atenet.router.route.duration histogram on meter.
+func NewRouteDurationHistogram(meter metric.Meter) (metric.Float64Histogram, error) {
+	h, err := meter.Float64Histogram(
+		routeDurationMetricName,
+		metric.WithUnit("s"),
+		metric.WithDescription(
+			"latency between Substrate router receiving a request and resolving "+
+				"the target worker endpoint, excluding actor execution and response",
+		),
+		metric.WithExplicitBucketBoundaries(
+			0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+			0.075, 0.1, 0.15, 0.2, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30,
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s histogram: %w", routeDurationMetricName, err)
+	}
+	return h, nil
+}
+
+func (s *Server) recordRouteDuration(ctx context.Context, d time.Duration, tmplNs, tmplName, outcome, resume string) {
+	if s.routeDuration == nil {
+		return
+	}
+	tmplNs = ateattr.NormalizeTemplateDimension(tmplNs)
+	tmplName = ateattr.NormalizeTemplateDimension(tmplName)
+	s.routeDuration.Record(ctx, d.Seconds(), metric.WithAttributes(
+		ateattr.TemplateAtespaceKey.String(tmplNs),
+		ateattr.TemplateNameKey.String(tmplName),
+		ateattr.RouterOutcomeKey.String(outcome),
+		ateattr.RouterResumeKey.String(resume),
+	))
+}
+
+func classifyOutcome(err error) string {
+	if err == nil {
+		return ateattr.RouterOutcomeOK
+	}
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return ateattr.RouterOutcomeCancelled
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return ateattr.RouterOutcomeTimeout
+	}
+	switch status.Code(err) {
+	case codes.ResourceExhausted:
+		return ateattr.RouterOutcomeNoCapacity
+	case codes.FailedPrecondition:
+		return ateattr.RouterOutcomeFailedPrecondition
+	case codes.Aborted:
+		return ateattr.RouterOutcomeLockConflict
+	case codes.NotFound:
+		return ateattr.RouterOutcomeNotFound
+	case codes.Unavailable:
+		return ateattr.RouterOutcomeUnavailable
+	case codes.PermissionDenied:
+		return ateattr.RouterOutcomeDenied
+	}
+	var re *ReqError
+	if errors.As(err, &re) {
+		switch envoy_type.StatusCode(re.StatusCode) {
+		case envoy_type.StatusCode_NotFound:
+			return ateattr.RouterOutcomeNotFound
+		case envoy_type.StatusCode_ServiceUnavailable:
+			// The switch above already reports no_capacity for a wrapped
+			// ResourceExhausted cause, since status.Code unwraps through
+			// ReqError.Cause. A 503 that reaches here has no such cause: a
+			// shed request whose resume did not fail with ResourceExhausted,
+			// or a failed policy or credential lookup. None of these mean
+			// the fleet is full.
+			return ateattr.RouterOutcomeUnavailable
+		case envoy_type.StatusCode_GatewayTimeout:
+			return ateattr.RouterOutcomeTimeout
+		case envoy_type.StatusCode_TooManyRequests:
+			return ateattr.RouterOutcomeRateLimited
+		case envoy_type.StatusCode_Forbidden:
+			return ateattr.RouterOutcomeDenied
+		}
+	}
+	return ateattr.RouterOutcomeResumeError
+}

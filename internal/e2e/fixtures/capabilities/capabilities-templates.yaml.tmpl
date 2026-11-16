@@ -1,0 +1,96 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The capabilities fixture's ActorTemplates: protojson-shaped
+# ateapi.ActorTemplate documents (NOT the ate.dev/v1 CRD), created
+# through the ate API by e2e.DeploySubstrateFixture. Three templates run the
+# same probe image and differ only in securityContext.capabilities, so the
+# suite can compare what the kernel reports inside the sandbox against what
+# the template asked for.
+
+# No securityContext: pins the default capability set, so a change to the
+# default is caught here and not only in atelet's unit tests.
+metadata:
+  atespace: ate-e2e${FIXTURE_SUFFIX}
+  name: caps-default
+workerSelector:
+  matchLabels:
+    workload: caps
+containers:
+- name: probe
+  image: ko://go.ate.dev/substrate/internal/e2e/fixtures/probe
+  command: ["/ko-app/probe"]
+  wakeupProbe:
+    httpGet:
+      path: /healthz
+      port: 80
+    timeoutSeconds: 60
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 536870912 # 512Mi
+
+---
+
+# The set is exact rather than relative, so asserting it proves the drop and
+# the add at once.
+metadata:
+  atespace: ate-e2e${FIXTURE_SUFFIX}
+  name: caps-exact
+workerSelector:
+  matchLabels:
+    workload: caps
+containers:
+- name: probe
+  image: ko://go.ate.dev/substrate/internal/e2e/fixtures/probe
+  command: ["/ko-app/probe"]
+  securityContext:
+    capabilities:
+      drop: ["ALL"]
+      add: ["NET_BIND_SERVICE"]
+  wakeupProbe:
+    httpGet:
+      path: /healthz
+      port: 80
+    timeoutSeconds: 60
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 536870912 # 512Mi
+---
+
+# No capabilities at all, and the probe still binds :80: both runtimes lift
+# the privileged-port limit, so the golden bake fails if that regresses.
+metadata:
+  atespace: ate-e2e${FIXTURE_SUFFIX}
+  name: caps-none
+workerSelector:
+  matchLabels:
+    workload: caps
+containers:
+- name: probe
+  image: ko://go.ate.dev/substrate/internal/e2e/fixtures/probe
+  command: ["/ko-app/probe"]
+  securityContext:
+    capabilities:
+      drop: ["ALL"]
+  wakeupProbe:
+    httpGet:
+      path: /healthz
+      port: 80
+    timeoutSeconds: 60
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 536870912 # 512Mi

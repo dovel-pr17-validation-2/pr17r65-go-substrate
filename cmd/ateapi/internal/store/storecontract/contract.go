@@ -1,0 +1,3860 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package storecontract provides backend-neutral assertions for store.Interface
+// implementations.
+package storecontract
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protopath"
+	"google.golang.org/protobuf/reflect/protorange"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+// testAtespace is the atespace used by tests that create a single actor.
+const testAtespace = "test-atespace"
+
+// testSnapshotOwnerUID stands in for the Actor UID an external snapshot's
+// prefix is keyed on. The store keeps a snapshot URI opaque, so the tests only
+// need URIs of the right shape, not ones an actual actor wrote.
+const testSnapshotOwnerUID = "6b1f9d0c-4a2e-4d38-9c77-5e0a1b2c3d4e"
+
+// foreignUID matches no stored object, for guards that must miss.
+const foreignUID = "0f0e0d0c-0b0a-4908-8706-050403020100"
+
+// testActorSnapshotURI returns the URI of a snapshot under an Actor's own
+// prefix, and testTagSnapshotURI the URI of the one snapshot a tag owns.
+func testActorSnapshotURI(location, atespace, name string) string {
+	return location + "/atespaces/" + atespace + "/actors/" + testSnapshotOwnerUID + "/snapshots/" + name
+}
+
+func testTagSnapshotURI(location, atespace, name string) string {
+	return location + "/atespaces/" + atespace + "/tags/" + name
+}
+
+// Worker resource names. They are opaque to the store, which only ever uses
+// them as the row key.
+const (
+	testWorkerName      = "3f9a5c2e-1d47-4b8a-9f21-6c0e5a7d3b18"
+	otherTestWorkerName = "7c1b8d4a-92e6-4f30-a5c7-2b8f61d0e934"
+
+	// testWorkerPodUID is deliberately not equal to either worker name, so no
+	// contract test can come to depend on them matching.
+	testWorkerPodUID = "d41b6e97-5a02-4c8d-b3f7-90e2c1a86d54"
+)
+
+// Atomic cmp options to skip individual server-owned ResourceMetadata fields
+// in proto diffs.
+var (
+	ignoreUID        = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "uid")
+	ignoreVersion    = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "version")
+	ignoreTimestamps = protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "create_time", "update_time", "delete_time")
+)
+
+func newTestAtespace(name string) *ateapi.Atespace {
+	return &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: name}}
+}
+
+// The fixture populates the volume/env union fields so the round-trip covers
+// the plain-field union shape (issue #962), including presence of the
+// optional value and type fields (empty string != unset).
+func newTestActorTemplate(atespace, name string) *ateapi.ActorTemplate {
+	return &ateapi.ActorTemplate{
+		Metadata: &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+		Containers: []*ateapi.Container{{
+			Name:         "main",
+			Image:        "example.com/app@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+			Env:          []*ateapi.EnvVar{{Name: "MODE", Value: "VAL"}},
+			VolumeMounts: []*ateapi.VolumeMount{{Name: "data", MountPath: "/data"}},
+		}},
+		Volumes: []*ateapi.Volume{{
+			Name:       "data",
+			DurableDir: &ateapi.DurableDirVolumeSource{},
+		}, {
+			Name: "system-info",
+			SystemInfo: &ateapi.SystemInfoVolumeSource{
+				DataSources: []*ateapi.SystemInfoDataSource{
+					{ActorMetadata: &ateapi.ActorMetadataDataSource{
+						Items: []*ateapi.ActorMetadataItem{{
+							Field: ateapi.ActorMetadataField_ACTOR_METADATA_FIELD_NAME,
+							Path:  "actor-id",
+						}},
+					}},
+					{TrustBundle: &ateapi.TrustBundleDataSource{
+						Names: []string{"egress-mitm.ate.dev"},
+						Path:  "trust-bundle.pem",
+					}},
+				},
+			},
+		}},
+		// Fully defaulted, as the RPC layer stores it, so a read that
+		// backfills defaults returns what was created.
+		SnapshotConfig: &ateapi.SnapshotConfig{
+			PreferredFidelity:    ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			GoldenSnapshotConfig: &ateapi.GoldenSnapshotConfig{Mode: ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED},
+		},
+	}
+}
+
+// newTestWorker builds a global-scoped Worker. name is the resource name the
+// store keys the row by; it is unrelated to worker_pod_uid.
+func newTestWorker(name, pod string) *ateapi.Worker {
+	return &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: name},
+		WorkerNamespace: "default",
+		WorkerPool:      "pool-1",
+		WorkerPod:       pod,
+		WorkerPodUid:    testWorkerPodUID,
+		Status: &ateapi.WorkerStatus{
+			Capacity: &ateapi.WorkerResources{CpuMillicores: 2000, MemoryBytes: 4 << 30},
+		},
+	}
+}
+
+// mustCreateAtespace creates the atespace an actor test is about to populate.
+// The PostgreSQL store enforces the actor->atespace foreign key.
+func mustCreateAtespace(t *testing.T, s store.Interface, name string) {
+	t.Helper()
+	if _, err := s.CreateAtespace(context.Background(), newTestAtespace(name)); err != nil {
+		t.Fatalf("CreateAtespace(%q) failed: %v", name, err)
+	}
+}
+
+func actorNameSet(actors []*ateapi.Actor) map[string]bool {
+	set := make(map[string]bool, len(actors))
+	for _, a := range actors {
+		set[a.GetMetadata().GetName()] = true
+	}
+	return set
+}
+
+func receiveEvent(t *testing.T, ch <-chan store.WorkerEvent) store.WorkerEvent {
+	t.Helper()
+	select {
+	case event, ok := <-ch:
+		if !ok {
+			t.Fatal("watch channel closed unexpectedly")
+		}
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for worker event")
+		return store.WorkerEvent{} // unreachable
+	}
+}
+
+// withUnknownField adds a field number no message in this binary declares to m and returns m.
+func withUnknownField[M proto.Message](m M) M {
+	b := protowire.AppendTag(nil, 9999, protowire.VarintType)
+	m.ProtoReflect().SetUnknown(protowire.AppendVarint(b, 42))
+	return m
+}
+
+// requireNoUnknownFields fails the test if m or any message nested in it carries unknown fields.
+func requireNoUnknownFields(t *testing.T, op string, m proto.Message) {
+	t.Helper()
+	err := protorange.Range(m.ProtoReflect(), func(p protopath.Values) error {
+		if msg, ok := p.Index(-1).Value.Interface().(protoreflect.Message); ok && len(msg.GetUnknown()) > 0 {
+			return fmt.Errorf("%s returned unknown fields at %v", op, p.Path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+// assertPruned checks that got is want with its unknown fields dropped, ignoring the server-owned version and timestamps.
+func assertPruned(t *testing.T, op string, want, got proto.Message) {
+	t.Helper()
+	requireNoUnknownFields(t, op, got)
+	if diff := cmp.Diff(want, got, protocmp.Transform(), protocmp.IgnoreUnknown(), ignoreVersion, ignoreTimestamps); diff != "" {
+		t.Errorf("%s mismatch (-want +got):\n%s", op, diff)
+	}
+}
+
+// resourceMessage is a stored resource, which carries ResourceMetadata.
+type resourceMessage interface {
+	proto.Message
+	GetMetadata() *ateapi.ResourceMetadata
+}
+
+// markForDeletionCase binds one resource's store methods for
+// testMarkForDeletion. R is the key the methods take.
+type markForDeletionCase[R any, T resourceMessage] struct {
+	ref    R
+	input  T
+	create func(context.Context, T) (T, error)
+	get    func(context.Context, R) (T, error)
+	update func(context.Context, R, store.Precondition, func(T) error) (T, error)
+	mark   func(context.Context, R, store.DeletePreconditions, func(T) error) (T, error)
+	// mutate, if set, is passed to the first mark, and mutated reports whether
+	// it landed in the same write.
+	mutate  func(T) error
+	mutated func(T) bool
+}
+
+// testMarkForDeletion checks the Mark<Resource>ForDeletion contract. Only a
+// mark sets delete_time, and no update clears it. A mark checks its guards,
+// writes nothing when mutate refuses, and keeps the first stamp when repeated.
+func testMarkForDeletion[R any, T resourceMessage](t *testing.T, c markForDeletionCase[R, T]) {
+	t.Helper()
+	ctx := context.Background()
+	c.input.GetMetadata().DeleteTime = timestamppb.Now()
+	created, err := c.create(ctx, c.input)
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	if created.GetMetadata().GetDeleteTime() != nil {
+		t.Fatalf("a new resource carries delete_time %v", created.GetMetadata().GetDeleteTime())
+	}
+
+	// A plain update cannot set it.
+	smuggled, err := c.update(ctx, c.ref, store.PreconditionFrom(created), func(toUpdate T) error {
+		toUpdate.GetMetadata().DeleteTime = timestamppb.Now()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if smuggled.GetMetadata().GetDeleteTime() != nil {
+		t.Errorf("a plain update set delete_time to %v, want it ignored", smuggled.GetMetadata().GetDeleteTime())
+	}
+
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{UID: "other-uid"}, nil); !errors.Is(err, store.ErrUIDConflict) {
+		t.Errorf("mark with a foreign uid = %v, want ErrUIDConflict", err)
+	}
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{Version: created.GetMetadata().GetVersion()}, nil); !errors.Is(err, store.ErrVersionConflict) {
+		t.Errorf("mark with a stale version = %v, want ErrVersionConflict", err)
+	}
+
+	// mutate's refusal writes nothing, so nothing is stamped.
+	refused := errors.New("refused")
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{}, func(T) error { return refused }); !errors.Is(err, refused) {
+		t.Errorf("mark with a refusing mutate = %v, want it verbatim", err)
+	}
+	unmarked, err := c.get(ctx, c.ref)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if unmarked.GetMetadata().GetDeleteTime() != nil || unmarked.GetMetadata().GetVersion() != smuggled.GetMetadata().GetVersion() {
+		t.Errorf("a refused mark wrote: delete_time %v, version %d, want unset and %d", unmarked.GetMetadata().GetDeleteTime(), unmarked.GetMetadata().GetVersion(), smuggled.GetMetadata().GetVersion())
+	}
+
+	// Unguarded, so the version having moved since created was read is fine.
+	marked, err := c.mark(ctx, c.ref, store.DeletePreconditions{}, c.mutate)
+	if err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if c.mutated != nil && !c.mutated(marked) {
+		t.Errorf("mark returned %v, want mutate's change in the same write", marked)
+	}
+	if marked.GetMetadata().GetDeleteTime() == nil {
+		t.Fatal("mark left delete_time unset")
+	}
+	if !marked.GetMetadata().GetDeleteTime().AsTime().Equal(marked.GetMetadata().GetUpdateTime().AsTime()) {
+		t.Errorf("delete_time = %v, want the write's update_time %v", marked.GetMetadata().GetDeleteTime().AsTime(), marked.GetMetadata().GetUpdateTime().AsTime())
+	}
+	if got, want := marked.GetMetadata().GetVersion(), smuggled.GetMetadata().GetVersion()+1; got != want {
+		t.Errorf("version = %d, want %d", got, want)
+	}
+	stored, err := c.get(ctx, c.ref)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if diff := cmp.Diff(marked, stored, protocmp.Transform()); diff != "" {
+		t.Errorf("stored resource mismatch (-marked +stored):\n%s", diff)
+	}
+
+	// A plain update cannot clear it.
+	cleared, err := c.update(ctx, c.ref, store.PreconditionFrom(marked), func(toUpdate T) error {
+		toUpdate.GetMetadata().DeleteTime = nil
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if !proto.Equal(cleared.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime()) {
+		t.Errorf("a plain update changed delete_time to %v, want %v kept", cleared.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime())
+	}
+
+	// The guards still bite after the mark: a version from before it is stale.
+	if _, err := c.mark(ctx, c.ref, store.DeletePreconditions{Version: smuggled.GetMetadata().GetVersion()}, nil); !errors.Is(err, store.ErrVersionConflict) {
+		t.Errorf("mark after the first with a stale version = %v, want ErrVersionConflict", err)
+	}
+
+	// A second mark writes but keeps the first stamp.
+	again, err := c.mark(ctx, c.ref, store.DeletePreconditions{UID: cleared.GetMetadata().GetUid()}, nil)
+	if err != nil {
+		t.Fatalf("second mark failed: %v", err)
+	}
+	if !proto.Equal(again.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime()) {
+		t.Errorf("a second mark changed delete_time to %v, want %v kept", again.GetMetadata().GetDeleteTime(), marked.GetMetadata().GetDeleteTime())
+	}
+	if got, want := again.GetMetadata().GetVersion(), cleared.GetMetadata().GetVersion()+1; got != want {
+		t.Errorf("version after the second mark = %d, want %d", got, want)
+	}
+}
+
+// RunContractTests runs the backend-neutral store.Interface assertions
+// against a fresh store.Interface built by setup for each subtest. setup is
+// responsible for its own cleanup (e.g. via t.Cleanup).
+//
+// PostgreSQL-specific behavior such as foreign-key races and transactional
+// notifications is not covered here; see atepg's own test file for that.
+func RunContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	runActorContractTests(t, setup)
+	runEgressPolicyContractTests(t, setup)
+	runWorkerContractTests(t, setup)
+	runWorkerAssignmentContractTests(t, setup)
+	runAtespaceContractTests(t, setup)
+	runActorTemplateContractTests(t, setup)
+	runTagContractTests(t, setup)
+	runLeaseContractTests(t, setup)
+	runListOptionsContractTests(t, setup)
+	runUnknownFieldContractTests(t, setup)
+}
+
+func runEgressPolicyContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("EgressPolicy_Lifecycle", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "session-1"},
+			Status:   &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		actorRef := resources.ActorRefFromActor(actor)
+		policy := &ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "default"},
+			Rules: []*ateapi.EgressRule{{
+				Http: &ateapi.HttpRule{Hostnames: []string{"api.example.com"}, Ports: &ateapi.Ports{Numbers: []int32{80}}},
+			}},
+		}
+
+		created, err := s.CreateEgressPolicy(ctx, actorRef, policy)
+		if err != nil {
+			t.Fatalf("CreateEgressPolicy failed: %v", err)
+		}
+		if md := created.GetMetadata(); md.GetName() != "default" || md.GetAtespace() != testAtespace || md.GetUid() == "" || md.GetVersion() != 1 || md.GetCreateTime() == nil || md.GetUpdateTime() == nil {
+			t.Fatalf("created metadata = %v", md)
+		}
+		if _, err := s.CreateEgressPolicy(ctx, actorRef, policy); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Fatalf("duplicate create error = %v, want ErrAlreadyExists", err)
+		}
+		got, err := s.GetEgressPolicy(ctx, actorRef)
+		if err != nil || !proto.Equal(got, created) {
+			t.Fatalf("GetEgressPolicy = %v, %v; want %v", got, err, created)
+		}
+		if _, err := s.UpdateEgressPolicy(ctx, actorRef, store.Precondition{}, func(*ateapi.EgressPolicy) error { return nil }); !errors.Is(err, store.ErrPreconditionRequired) {
+			t.Fatalf("unguarded update error = %v, want ErrPreconditionRequired", err)
+		}
+		if _, err := s.UpdateEgressPolicy(ctx, actorRef, store.Precondition{UID: created.GetMetadata().GetUid(), Version: 99}, func(*ateapi.EgressPolicy) error { return nil }); !errors.Is(err, store.ErrVersionConflict) {
+			t.Fatalf("stale update error = %v, want ErrVersionConflict", err)
+		}
+		if _, err := s.UpdateEgressPolicy(ctx, actorRef, store.Precondition{UID: "replacement-uid", Version: 1}, func(*ateapi.EgressPolicy) error { return nil }); !errors.Is(err, store.ErrUIDConflict) {
+			t.Fatalf("wrong UID update error = %v, want ErrUIDConflict", err)
+		}
+		updated, err := s.UpdateEgressPolicy(ctx, actorRef, store.PreconditionFrom(created), func(policy *ateapi.EgressPolicy) error {
+			policy.Metadata.Atespace = "other"
+			policy.Metadata.Name = "other"
+			policy.Rules = []*ateapi.EgressRule{{TlsPassthrough: &ateapi.TlsPassthroughRule{Hostnames: []string{"*"}, Ports: &ateapi.Ports{Numbers: []int32{443}}}}}
+			return nil
+		})
+		if err != nil || updated.GetMetadata().GetAtespace() != testAtespace || updated.GetMetadata().GetName() != "default" || updated.GetMetadata().GetVersion() != 2 || updated.GetMetadata().GetUid() != created.GetMetadata().GetUid() {
+			t.Fatalf("UpdateEgressPolicy = %v, %v; want version 2", updated, err)
+		}
+		deleted, err := s.DeleteEgressPolicy(ctx, actorRef, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteEgressPolicy failed: %v", err)
+		}
+		if diff := cmp.Diff(updated, deleted, protocmp.Transform(), protocmp.IgnoreFields(&ateapi.ResourceMetadata{}, "delete_time")); diff != "" {
+			t.Fatalf("deleted policy mismatch (-updated +deleted):\n%s", diff)
+		}
+		if deleted.GetMetadata().GetDeleteTime() == nil {
+			t.Error("the deleted policy carries no delete_time")
+		}
+		if _, err := s.GetEgressPolicy(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("GetEgressPolicy after delete error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("EgressPolicy_DeletePreconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
+		if _, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, actorRef.Name)); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		create := func() *ateapi.EgressPolicy {
+			created, err := s.CreateEgressPolicy(ctx, actorRef, &ateapi.EgressPolicy{
+				Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "default"},
+			})
+			if err != nil {
+				t.Fatalf("CreateEgressPolicy failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteEgressPolicy(ctx, actorRef, precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing policy = %v, want ErrNotFound", err)
+		}
+
+		policy := create()
+		uid, version := policy.GetMetadata().GetUid(), policy.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetEgressPolicy(ctx, actorRef); err != nil {
+			t.Fatalf("a refused delete removed the policy: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		policy = create()
+		if err := del(store.DeletePreconditions{UID: policy.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		policy = create()
+		if err := del(store.DeletePreconditions{UID: policy.GetMetadata().GetUid(), Version: policy.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetEgressPolicy(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("EgressPolicy_ActorLifecycle", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
+		policy := &ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "default"},
+		}
+		if _, err := s.CreateEgressPolicy(ctx, actorRef, policy); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("policy without Actor error = %v, want ErrFailedPrecondition", err)
+		}
+		actor, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: actorRef.Name},
+			Status:   &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_DELETING},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CreateEgressPolicy(ctx, actorRef, policy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetEgressPolicy(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("policy after Actor deletion error = %v, want ErrNotFound", err)
+		}
+		replacement, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: actorRef.Name},
+			Status:   &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replacement.GetMetadata().GetUid() == actor.GetMetadata().GetUid() {
+			t.Fatal("replacement Actor reused UID")
+		}
+		if _, err := s.GetEgressPolicy(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("replacement Actor inherited policy: %v", err)
+		}
+	})
+}
+
+func runListOptionsContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("ListOptions_InvalidPageSize", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		calls := []struct {
+			name string
+			call func(store.ListOptions) error
+		}{
+			{"atespaces", func(opts store.ListOptions) error { _, err := s.ListAtespaces(ctx, opts); return err }},
+			{"actors", func(opts store.ListOptions) error { _, err := s.ListActors(ctx, "", opts); return err }},
+			{"actor templates", func(opts store.ListOptions) error { _, err := s.ListActorTemplates(ctx, "", opts); return err }},
+			{"tags", func(opts store.ListOptions) error { _, err := s.ListTags(ctx, "", opts); return err }},
+			{"workers", func(opts store.ListOptions) error { _, err := s.ListWorkers(ctx, opts); return err }},
+		}
+		for _, call := range calls {
+			t.Run(call.name, func(t *testing.T) {
+				if err := call.call(store.ListOptions{PageSize: -1}); !errors.Is(err, store.ErrInvalidPageSize) {
+					t.Errorf("negative PageSize error = %v, want ErrInvalidPageSize", err)
+				}
+				if err := call.call(store.ListOptions{}); err != nil {
+					t.Errorf("zero PageSize error = %v, want nil", err)
+				}
+			})
+		}
+	})
+
+	t.Run("ListOptions_InvalidPageToken", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		calls := []struct {
+			name string
+			call func(store.ListOptions) error
+		}{
+			{"atespaces", func(opts store.ListOptions) error { _, err := s.ListAtespaces(ctx, opts); return err }},
+			{"actors", func(opts store.ListOptions) error { _, err := s.ListActors(ctx, "", opts); return err }},
+			{"actor templates", func(opts store.ListOptions) error { _, err := s.ListActorTemplates(ctx, "", opts); return err }},
+			{"tags", func(opts store.ListOptions) error { _, err := s.ListTags(ctx, "", opts); return err }},
+			{"workers", func(opts store.ListOptions) error { _, err := s.ListWorkers(ctx, opts); return err }},
+		}
+		for _, call := range calls {
+			t.Run(call.name, func(t *testing.T) {
+				if err := call.call(store.ListOptions{PageSize: 1, PageToken: "%%%"}); !errors.Is(err, store.ErrInvalidPageToken) {
+					t.Errorf("malformed PageToken error = %v, want ErrInvalidPageToken", err)
+				}
+			})
+		}
+	})
+}
+
+func runActorContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("GetActor_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		_, err := s.GetActor(ctx, resources.ActorRef{Atespace: testAtespace, Name: "non-existent"})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("CreateActor_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		actor := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		}
+
+		created, err := s.CreateActor(ctx, actor)
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		if created.GetMetadata().GetUid() == "" {
+			t.Errorf("CreateActor returned empty uid; want server-assigned uid")
+		}
+		if created.GetMetadata().GetVersion() != 1 {
+			t.Errorf("CreateActor returned version %d, want 1", created.GetMetadata().GetVersion())
+		}
+		if created.GetMetadata().GetCreateTime() == nil || created.GetMetadata().GetUpdateTime() == nil {
+			t.Errorf("CreateActor returned unset create/update time")
+		}
+
+		if actor.GetMetadata().GetUid() != "" || actor.GetMetadata().GetVersion() != 0 {
+			t.Errorf("CreateActor must not mutate its input, got metadata %v", actor.GetMetadata())
+		}
+
+		got, err := s.GetActor(ctx, resources.ActorRefFromActor(actor))
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if diff := cmp.Diff(created, got, protocmp.Transform()); diff != "" {
+			t.Errorf("CreateActor return does not match stored state (-created +got):\n%s", diff)
+		}
+
+		expected := proto.Clone(actor).(*ateapi.Actor)
+		expected.Metadata.Version = 1
+		if diff := cmp.Diff(expected, created, protocmp.Transform(), ignoreUID, ignoreTimestamps); diff != "" {
+			t.Errorf("CreateActor returned unexpected actor (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("CreateActor_AlreadyExists", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		actor := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		}
+
+		if _, err := s.CreateActor(ctx, actor); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, actor); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("expected ErrAlreadyExists, got %v", err)
+		}
+	})
+
+	t.Run("Actor_MalformedSnapshotURI", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		const malformedURI = "gs://private/not-a-snapshot"
+
+		actor := newTestSuspendedActor(testAtespace, "session-1")
+		actor.Status.Snapshots[0].DurableSnapshot.Object.SnapshotUri = malformedURI
+		if _, err := s.CreateActor(ctx, actor); err == nil {
+			t.Errorf("CreateActor with a malformed snapshot URI succeeded, want an error")
+		}
+
+		created, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "session-2"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if _, err := s.UpdateActor(ctx, resources.ActorRefFromActor(created), store.PreconditionFrom(created), func(toUpdate *ateapi.Actor) error {
+			toUpdate.Status.Snapshots[0].DurableSnapshot.Object.SnapshotUri = malformedURI
+			return nil
+		}); err == nil {
+			t.Errorf("UpdateActor to a malformed snapshot URI succeeded, want an error")
+		}
+	})
+
+	t.Run("UpdateActor_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		actor := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		}
+
+		created, err := s.CreateActor(ctx, actor)
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		actorRef := resources.ActorRefFromActor(created)
+		updated, err := s.UpdateActor(ctx, actorRef, store.PreconditionFrom(created), func(dbActor *ateapi.Actor) error {
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			// Server-owned metadata must be derived from the stored resource, not
+			// accepted from the mutation.
+			dbActor.Metadata.Uid = "client-supplied-uid"
+			dbActor.Metadata.CreateTime = timestamppb.New(time.Unix(1, 0))
+			dbActor.Metadata.Version = 99
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateActor failed: %v", err)
+		}
+
+		if updated.GetStatus().GetState() != ateapi.ActorState_ACTOR_STATE_RUNNING {
+			t.Errorf("UpdateActor returned state %v, want RUNNING", updated.GetStatus().GetState())
+		}
+		if updated.GetMetadata().GetVersion() != 2 {
+			t.Errorf("UpdateActor returned version %d, want 2", updated.GetMetadata().GetVersion())
+		}
+		if updated.GetMetadata().GetUid() != created.GetMetadata().GetUid() {
+			t.Errorf("uid changed on update: got %q, want %q", updated.GetMetadata().GetUid(), created.GetMetadata().GetUid())
+		}
+		if !updated.GetMetadata().GetCreateTime().AsTime().Equal(created.GetMetadata().GetCreateTime().AsTime()) {
+			t.Errorf("create_time changed on update: got %v, want %v", updated.GetMetadata().GetCreateTime().AsTime(), created.GetMetadata().GetCreateTime().AsTime())
+		}
+
+		if created.GetMetadata().GetVersion() != 1 {
+			t.Errorf("UpdateActor mutated the previously returned actor; version changed to %d", created.GetMetadata().GetVersion())
+		}
+
+		got, err := s.GetActor(ctx, resources.ActorRefFromActor(actor))
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if diff := cmp.Diff(updated, got, protocmp.Transform()); diff != "" {
+			t.Errorf("UpdateActor return does not match stored state (-updated +got):\n%s", diff)
+		}
+	})
+
+	t.Run("UpdateActor_Conflict", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		actor := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		}
+
+		if _, err := s.CreateActor(ctx, actor); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		actor1, err := s.GetActor(ctx, resources.ActorRefFromActor(actor))
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		actor2, err := s.GetActor(ctx, resources.ActorRefFromActor(actor))
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+
+		actorRef := resources.ActorRefFromActor(actor1)
+		if _, err := s.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor1), func(dbActor *ateapi.Actor) error {
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			return nil
+		}); err != nil {
+			t.Fatalf("UpdateActor failed: %v", err)
+		}
+
+		_, err = s.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor2), func(dbActor *ateapi.Actor) error {
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_SUSPENDED
+			return nil
+		})
+		if !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("expected ErrVersionConflict, got %v", err)
+		}
+	})
+
+	t.Run("UpdateActor_UIDConflict", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		newActor := func() *ateapi.Actor {
+			return &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+			}
+		}
+
+		original, err := s.CreateActor(ctx, newActor())
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		actorRef := resources.ActorRefFromActor(original)
+
+		if _, err := s.UpdateActor(ctx, actorRef, store.PreconditionFrom(original), func(dbActor *ateapi.Actor) error {
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_DELETING
+			return nil
+		}); err != nil {
+			t.Fatalf("marking actor deleting failed: %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActor failed: %v", err)
+		}
+		recreated, err := s.CreateActor(ctx, newActor())
+		if err != nil {
+			t.Fatalf("recreate CreateActor failed: %v", err)
+		}
+		if recreated.GetMetadata().GetUid() == original.GetMetadata().GetUid() {
+			t.Fatalf("recreated actor reused uid %s, want a fresh one", recreated.GetMetadata().GetUid())
+		}
+
+		// original and recreated have different UIDs, so the mutation must never run
+		_, err = s.UpdateActor(ctx, actorRef, store.PreconditionFrom(original), func(dbActor *ateapi.Actor) error {
+			t.Error("mutate ran past its precondition once the guarded incarnation was gone")
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			return nil
+		})
+		if !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("UpdateActor error = %v, want one matching store.ErrUIDConflict", err)
+		}
+
+		got, err := s.GetActor(ctx, actorRef)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if diff := cmp.Diff(recreated, got, protocmp.Transform()); diff != "" {
+			t.Errorf("rejected update changed the stored actor (-recreated +got):\n%s", diff)
+		}
+	})
+
+	t.Run("UpdateActor_MutateError", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		created, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		})
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		mutateErr := errors.New("mutation rejected")
+		if _, err := s.UpdateActor(ctx, resources.ActorRefFromActor(created), store.PreconditionFrom(created), func(dbActor *ateapi.Actor) error {
+			dbActor.Status.State = ateapi.ActorState_ACTOR_STATE_RUNNING
+			return fmt.Errorf("checking mutation: %w", mutateErr)
+		}); !errors.Is(err, mutateErr) {
+			t.Fatalf("UpdateActor error = %v, want one wrapping %v", err, mutateErr)
+		}
+
+		got, err := s.GetActor(ctx, resources.ActorRefFromActor(created))
+		if err != nil {
+			t.Fatalf("GetActor after rejected mutation failed: %v", err)
+		}
+		if diff := cmp.Diff(created, got, protocmp.Transform()); diff != "" {
+			t.Errorf("rejected mutation changed stored actor (-created +got):\n%s", diff)
+		}
+	})
+
+	t.Run("UpdateActor_MissingPrecondition", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		created, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+			Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+		})
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		actorRef := resources.ActorRefFromActor(created)
+
+		tests := []struct {
+			name         string
+			actorRef     resources.ActorRef
+			precondition store.Precondition
+		}{
+			{
+				name:         "no precondition",
+				actorRef:     actorRef,
+				precondition: store.Precondition{},
+			},
+			{
+				name:         "guarding on only a uid",
+				actorRef:     actorRef,
+				precondition: store.Precondition{UID: created.GetMetadata().GetUid()},
+			},
+			{
+				name:         "guarding on only a version",
+				actorRef:     actorRef,
+				precondition: store.Precondition{Version: created.GetMetadata().GetVersion()},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := s.UpdateActor(ctx, tt.actorRef, tt.precondition, func(dbActor *ateapi.Actor) error {
+					t.Fatal("mutate ran for a blind write")
+					return nil
+				})
+				if !errors.Is(err, store.ErrPreconditionRequired) {
+					t.Errorf("UpdateActor error = %v, want one matching store.ErrPreconditionRequired", err)
+				}
+			})
+		}
+	})
+
+	t.Run("MarkActorForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		testMarkForDeletion(t, markForDeletionCase[resources.ActorRef, *ateapi.Actor]{
+			ref:    resources.ActorRef{Atespace: testAtespace, Name: "session-1"},
+			input:  newTestSuspendedActor(testAtespace, "session-1"),
+			create: s.CreateActor,
+			get:    s.GetActor,
+			update: s.UpdateActor,
+			mark:   s.MarkActorForDeletion,
+			mutate: func(toUpdate *ateapi.Actor) error {
+				toUpdate.Status.State = ateapi.ActorState_ACTOR_STATE_DELETING
+				return nil
+			},
+			mutated: func(marked *ateapi.Actor) bool {
+				return marked.GetStatus().GetState() == ateapi.ActorState_ACTOR_STATE_DELETING
+			},
+		})
+	})
+
+	// The store does not gate the delete on state; the workflow does, and pins
+	// the row delete to the uid it admitted.
+	t.Run("DeleteActor", func(t *testing.T) {
+		for _, state := range []ateapi.ActorState{
+			ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+			ateapi.ActorState_ACTOR_STATE_CRASHED,
+			ateapi.ActorState_ACTOR_STATE_DELETING,
+			ateapi.ActorState_ACTOR_STATE_RUNNING,
+		} {
+			t.Run(state.String(), func(t *testing.T) {
+				s := setup(t)
+				ctx := context.Background()
+				mustCreateAtespace(t, s, testAtespace)
+
+				actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
+				if _, err := s.CreateActor(ctx, &ateapi.Actor{
+					Metadata:      &ateapi.ResourceMetadata{Name: actorRef.Name, Atespace: testAtespace},
+					ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "test-template"},
+					Status:        &ateapi.ActorStatus{State: state},
+				}); err != nil {
+					t.Fatalf("CreateActor failed: %v", err)
+				}
+
+				deleted, err := s.DeleteActor(ctx, actorRef, store.DeletePreconditions{})
+				if err != nil {
+					t.Fatalf("DeleteActor failed: %v", err)
+				}
+				if got := deleted.GetMetadata().GetName(); got != actorRef.Name {
+					t.Errorf("deleted actor name = %q, want %q", got, actorRef.Name)
+				}
+				if _, err := s.GetActor(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+					t.Errorf("expected ErrNotFound after delete, got %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("DeleteActor_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.DeleteActor(ctx, resources.ActorRef{Atespace: testAtespace, Name: "non-existent"}, store.DeletePreconditions{}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound deleting non-existent actor, got %v", err)
+		}
+	})
+
+	t.Run("DeleteActor_Preconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actorRef := resources.ActorRef{Atespace: testAtespace, Name: "session-1"}
+		create := func() *ateapi.Actor {
+			created, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, actorRef.Name))
+			if err != nil {
+				t.Fatalf("CreateActor failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteActor(ctx, actorRef, precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing actor = %v, want ErrNotFound", err)
+		}
+
+		actor := create()
+		uid, version := actor.GetMetadata().GetUid(), actor.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetActor(ctx, actorRef); err != nil {
+			t.Fatalf("a refused delete removed the actor: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		actor = create()
+		if err := del(store.DeletePreconditions{UID: actor.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		actor = create()
+		if err := del(store.DeletePreconditions{UID: actor.GetMetadata().GetUid(), Version: actor.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetActor(ctx, actorRef); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("ListActors_Empty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		actorsResp, err := s.ListActors(ctx, "", store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListActors failed: %v", err)
+		}
+		if len(actorsResp.Items) != 0 {
+			t.Errorf("expected 0 actors, got %d", len(actorsResp.Items))
+		}
+	})
+
+	t.Run("ListActors", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		actor1 := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "id1", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+			Status: &ateapi.ActorStatus{
+				State:                  ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+				LastAssignedGeneration: 1,
+				Snapshots: []*ateapi.Snapshot{{
+					Generation: 1,
+					Owner:      ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+					Fidelity:   ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+					DurableSnapshot: &ateapi.SnapshotStorage{
+						State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+						Object: &ateapi.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-1")},
+					},
+				}},
+			},
+		}
+		actor2 := &ateapi.Actor{
+			Metadata:      &ateapi.ResourceMetadata{Name: "id2", Atespace: testAtespace},
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+			Status: &ateapi.ActorStatus{
+				State:                  ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+				LastAssignedGeneration: 1,
+				Snapshots: []*ateapi.Snapshot{{
+					Generation: 1,
+					Owner:      ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+					Fidelity:   ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+					DurableSnapshot: &ateapi.SnapshotStorage{
+						State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+						Object: &ateapi.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://bucket", testAtespace, "snapshot-2")},
+					},
+				}},
+			},
+		}
+		if _, err := s.CreateActor(ctx, actor1); err != nil {
+			t.Fatalf("failed to create actor1: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, actor2); err != nil {
+			t.Fatalf("failed to create actor2: %v", err)
+		}
+
+		actorsResp, err := s.ListActors(ctx, "", store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListActors failed: %v", err)
+		}
+		actors := actorsResp.Items
+		if len(actors) != 2 {
+			t.Errorf("expected 2 actors, got %d", len(actors))
+		}
+		if got := actorNameSet(actors); !got["id1"] || !got["id2"] {
+			t.Errorf("did not find all actors: %v", got)
+		}
+	})
+
+	t.Run("ListActors_Pagination", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+
+		for i := 0; i < 5; i++ {
+			actor := &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Name: fmt.Sprintf("name%d", i), Atespace: testAtespace},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+			}
+			if _, err := s.CreateActor(ctx, actor); err != nil {
+				t.Fatalf("failed to create actor %d: %v", i, err)
+			}
+		}
+
+		var allActors []*ateapi.Actor
+		pageToken := ""
+		for {
+			page, err := s.ListActors(ctx, "", store.ListOptions{PageSize: 2, PageToken: pageToken})
+			if err != nil {
+				t.Fatalf("ListActors failed: %v", err)
+			}
+			allActors = append(allActors, page.Items...)
+			pageToken = page.NextPageToken
+			if pageToken == "" {
+				break
+			}
+		}
+
+		if len(allActors) != 5 {
+			t.Fatalf("expected 5 actors total, got %d", len(allActors))
+		}
+		seen := make(map[string]bool)
+		for _, a := range allActors {
+			if seen[a.GetMetadata().GetName()] {
+				t.Errorf("duplicate actor found in paginated results: %s", a.GetMetadata().GetName())
+			}
+			seen[a.GetMetadata().GetName()] = true
+		}
+	})
+
+	t.Run("ListActors_ScopedByAtespace", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, "team-a")
+		mustCreateAtespace(t, s, "team-b")
+
+		mkActor := func(atespace, name string) *ateapi.Actor {
+			return &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Name: name, Atespace: atespace},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+				Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
+			}
+		}
+		for _, a := range []*ateapi.Actor{mkActor("team-a", "a1"), mkActor("team-a", "a2"), mkActor("team-b", "b1")} {
+			if _, err := s.CreateActor(ctx, a); err != nil {
+				t.Fatalf("CreateActor(%s/%s) failed: %v", a.GetMetadata().GetAtespace(), a.GetMetadata().GetName(), err)
+			}
+		}
+
+		teamAResp, err := s.ListActors(ctx, "team-a", store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListActors(team-a) failed: %v", err)
+		}
+		if got := actorNameSet(teamAResp.Items); !got["a1"] || !got["a2"] || got["b1"] || len(got) != 2 {
+			t.Errorf("ListActors(team-a) = %v, want exactly {a1, a2}", got)
+		}
+
+		teamBResp, err := s.ListActors(ctx, "team-b", store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListActors(team-b) failed: %v", err)
+		}
+		if got := actorNameSet(teamBResp.Items); !got["b1"] || got["a1"] || len(got) != 1 {
+			t.Errorf("ListActors(team-b) = %v, want exactly {b1}", got)
+		}
+
+		allResp, err := s.ListActors(ctx, "", store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListActors(all) failed: %v", err)
+		}
+		if got := actorNameSet(allResp.Items); !got["a1"] || !got["a2"] || !got["b1"] || len(got) != 3 {
+			t.Errorf("ListActors(all) = %v, want exactly {a1, a2, b1}", got)
+		}
+
+		if _, err := s.GetActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "a1"}); err != nil {
+			t.Errorf("GetActor(team-a, a1) failed: %v", err)
+		}
+		if _, err := s.GetActor(ctx, resources.ActorRef{Atespace: "team-b", Name: "a1"}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetActor(team-b, a1) = %v, want ErrNotFound", err)
+		}
+		if _, err := s.GetActor(ctx, resources.ActorRef{Name: "a1"}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetActor(empty, a1) = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+func runActorTemplateContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("ActorTemplateAndVersion_Lifecycle", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, "team-a")
+
+		input := newTestActorTemplate("team-a", "tmpl-a")
+		created, err := s.CreateActorTemplate(ctx, input)
+		if err != nil {
+			t.Fatalf("CreateActorTemplate failed: %v", err)
+		}
+		if created.GetMetadata().GetUid() == "" || created.GetMetadata().GetVersion() != 1 {
+			t.Errorf("created template metadata = %v, want assigned uid and version 1", created.GetMetadata())
+		}
+		if input.GetMetadata().GetUid() != "" || input.GetMetadata().GetVersion() != 0 {
+			t.Errorf("CreateActorTemplate mutated its input: %v", input.GetMetadata())
+		}
+		templateRef := resources.ActorTemplateRef{Atespace: "team-a", Name: "tmpl-a"}
+		gotTemplate, err := s.GetActorTemplate(ctx, templateRef)
+		if err != nil {
+			t.Fatalf("GetActorTemplate failed: %v", err)
+		}
+		if diff := cmp.Diff(created, gotTemplate, protocmp.Transform()); diff != "" {
+			t.Errorf("stored template mismatch (-created +got):\n%s", diff)
+		}
+
+		if _, err := s.DeleteActorTemplate(ctx, templateRef, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActorTemplate failed: %v", err)
+		}
+	})
+
+	t.Run("DeleteActorTemplate_Preconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		ref := resources.ActorTemplateRef{Atespace: testAtespace, Name: "tmpl-a"}
+		create := func() *ateapi.ActorTemplate {
+			created, err := s.CreateActorTemplate(ctx, newTestActorTemplate(testAtespace, ref.Name))
+			if err != nil {
+				t.Fatalf("CreateActorTemplate failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteActorTemplate(ctx, ref, precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing template = %v, want ErrNotFound", err)
+		}
+
+		template := create()
+		uid, version := template.GetMetadata().GetUid(), template.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetActorTemplate(ctx, ref); err != nil {
+			t.Fatalf("a refused delete removed the template: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		template = create()
+		if err := del(store.DeletePreconditions{UID: template.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		template = create()
+		if err := del(store.DeletePreconditions{UID: template.GetMetadata().GetUid(), Version: template.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetActorTemplate(ctx, ref); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpdateActorTemplate_MissingPrecondition", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, "team-a")
+
+		created, err := s.CreateActorTemplate(ctx, newTestActorTemplate("team-a", "tmpl-a"))
+		if err != nil {
+			t.Fatalf("CreateActorTemplate failed: %v", err)
+		}
+		templateRef := resources.ActorTemplateRef{Atespace: "team-a", Name: "tmpl-a"}
+
+		tests := []struct {
+			name         string
+			precondition store.Precondition
+		}{
+			{
+				name:         "no precondition",
+				precondition: store.Precondition{},
+			},
+			{
+				name:         "guarding on only a uid",
+				precondition: store.Precondition{UID: created.GetMetadata().GetUid()},
+			},
+			{
+				name:         "guarding on only a version",
+				precondition: store.Precondition{Version: created.GetMetadata().GetVersion()},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := s.UpdateActorTemplate(ctx, templateRef, tt.precondition, func(dbTemplate *ateapi.ActorTemplate) error {
+					t.Fatal("mutate ran for a blind write")
+					return nil
+				})
+				if !errors.Is(err, store.ErrPreconditionRequired) {
+					t.Errorf("UpdateActorTemplate error = %v, want one matching store.ErrPreconditionRequired", err)
+				}
+			})
+		}
+	})
+
+	t.Run("MarkActorTemplateForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		testMarkForDeletion(t, markForDeletionCase[resources.ActorTemplateRef, *ateapi.ActorTemplate]{
+			ref:    resources.ActorTemplateRef{Atespace: testAtespace, Name: "tmpl-a"},
+			input:  newTestActorTemplate(testAtespace, "tmpl-a"),
+			create: s.CreateActorTemplate,
+			get:    s.GetActorTemplate,
+			update: s.UpdateActorTemplate,
+			mark:   s.MarkActorTemplateForDeletion,
+		})
+	})
+
+	t.Run("ActorTemplateResources_BlockAtespaceDeletion", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, "team-a")
+		if _, err := s.CreateActorTemplate(ctx, newTestActorTemplate("team-a", "tmpl-a")); err != nil {
+			t.Fatalf("CreateActorTemplate failed: %v", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("DeleteAtespace with template = %v, want ErrFailedPrecondition", err)
+		}
+	})
+}
+
+// newTestSuspendedActor builds an actor that already holds a durable
+// snapshot, the state CreateTag tags from.
+func newTestSuspendedActor(atespace, name string) *ateapi.Actor {
+	return &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "ns1", Name: "tmpl1"},
+		Status: &ateapi.ActorStatus{
+			State:                  ateapi.ActorState_ACTOR_STATE_SUSPENDED,
+			LastAssignedGeneration: 1,
+			Snapshots: []*ateapi.Snapshot{{
+				Generation: 1,
+				Owner:      ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+				Fidelity:   ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				DurableSnapshot: &ateapi.SnapshotStorage{
+					State:  ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+					Object: &ateapi.ObjectSnapshot{SnapshotUri: testActorSnapshotURI("gs://private", atespace, name)},
+				},
+			}},
+		},
+	}
+}
+
+// newTestInProgressTag builds the row CreateTag reserves for a
+// tag of actor: ATESPACE-scoped, with a PENDING snapshot naming where the
+// copy is going.
+func newTestInProgressTag(name string, actor *ateapi.Actor) *ateapi.Tag {
+	atespace := actor.GetMetadata().GetAtespace()
+	return &ateapi.Tag{
+		Metadata: &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+		Scope:    ateapi.TagScope_TAG_SCOPE_ATESPACE,
+		Status: &ateapi.TagStatus{
+			ActorTemplateUid: "template-uid",
+			Snapshot: &ateapi.Snapshot{
+				Generation: 1,
+				Owner:      ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+				Fidelity:   ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				DurableSnapshot: &ateapi.SnapshotStorage{
+					State: ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING,
+					Object: &ateapi.ObjectSnapshot{
+						SnapshotUri: testTagSnapshotURI("gs://private", atespace, name),
+					},
+				},
+			},
+		},
+	}
+}
+
+func runTagContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	// seedSuspendedActor seeds an atespace and an actor holding a durable
+	// snapshot, the precondition every tag test starts from.
+	seedSuspendedActor := func(t *testing.T, s store.Interface, atespace, name string) *ateapi.Actor {
+		t.Helper()
+		mustCreateAtespace(t, s, atespace)
+		actor, err := s.CreateActor(context.Background(), newTestSuspendedActor(atespace, name))
+		if err != nil {
+			t.Fatalf("CreateActor(%s/%s) failed: %v", atespace, name, err)
+		}
+		return actor
+	}
+
+	t.Run("Tag_Lifecycle", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+
+		inProgressTag := newTestInProgressTag("production", actor)
+		pending, err := s.CreateTag(ctx, inProgressTag)
+		if err != nil {
+			t.Fatalf("CreateTag failed: %v", err)
+		}
+		if pending.GetMetadata().GetVersion() != 1 || pending.GetMetadata().GetUid() == "" {
+			t.Errorf("created tag metadata = %v, want server-owned uid and version 1", pending.GetMetadata())
+		}
+		if inProgressTag.GetMetadata().GetUid() != "" || inProgressTag.GetMetadata().GetVersion() != 0 {
+			t.Errorf("CreateTag mutated its input metadata: %v", inProgressTag.GetMetadata())
+		}
+
+		tag, err := s.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"})
+		if err != nil {
+			t.Fatalf("GetTag failed: %v", err)
+		}
+		// A reserved tag has a PENDING snapshot storage entry and is not
+		// usable until the copy lands and finalize marks it COMPLETED.
+		if got := tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState(); got != ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING {
+			t.Errorf("reserved tag snapshot storage state = %v, want PENDING", got)
+		}
+		if diff := cmp.Diff(inProgressTag, tag, protocmp.Transform(), ignoreUID, ignoreVersion, ignoreTimestamps); diff != "" {
+			t.Errorf("stored tag mismatch (-want +got):\n%s", diff)
+		}
+
+		// Try to get a tag that doens't exist
+		if _, err := s.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "missing"}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("missing GetTag = %v, want ErrNotFound", err)
+		}
+
+		// Finalize: publishing the copy is the one transition status.snapshot allows.
+		ready, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.PreconditionFrom(tag), finalizeTag)
+		if err != nil {
+			t.Fatalf("finalizing tag failed: %v", err)
+		}
+		wantURI := testTagSnapshotURI("gs://private", "team-a", "production")
+		gotURI := ready.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri()
+		if gotURI != wantURI {
+			t.Errorf("finalized tag snapshot uri = %q, want %q", gotURI, wantURI)
+		}
+		if got := ready.GetStatus().GetSnapshot().GetDurableSnapshot().GetState(); got != ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			t.Errorf("finalized tag snapshot storage state = %v, want COMPLETED", got)
+		}
+
+		updated, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.PreconditionFrom(ready), func(toUpdate *ateapi.Tag) error {
+			toUpdate.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateTag failed: %v", err)
+		}
+		if updated.GetScope() != ateapi.TagScope_TAG_SCOPE_PUBLISHED || updated.GetMetadata().GetVersion() != ready.GetMetadata().GetVersion()+1 {
+			t.Errorf("updated tag = %v, want published scope and advanced version", updated)
+		}
+		if _, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.PreconditionFrom(ready), func(toUpdate *ateapi.Tag) error {
+			toUpdate.Scope = ready.GetScope()
+			return nil
+		}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale UpdateTag = %v, want ErrVersionConflict", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("DeleteAtespace with tag = %v, want ErrFailedPrecondition", err)
+		}
+
+		deleted, err := s.DeleteTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.DeletePreconditions{})
+		if err != nil || !proto.Equal(deleted, updated) {
+			t.Errorf("DeleteTag = (%v, %v), want updated tag", deleted, err)
+		}
+		if _, err := s.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("deleted GetTag = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("DeleteTag_Preconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "actor-1"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		tagRef := resources.TagRef{Atespace: testAtespace, Name: "production"}
+		create := func() *ateapi.Tag {
+			created, err := s.CreateTag(ctx, newTestInProgressTag(tagRef.Name, actor))
+			if err != nil {
+				t.Fatalf("CreateTag failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteTag(ctx, tagRef, precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing tag = %v, want ErrNotFound", err)
+		}
+
+		tag := create()
+		uid, version := tag.GetMetadata().GetUid(), tag.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetTag(ctx, tagRef); err != nil {
+			t.Fatalf("a refused delete removed the tag: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		tag = create()
+		if err := del(store.DeletePreconditions{UID: tag.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		tag = create()
+		if err := del(store.DeletePreconditions{UID: tag.GetMetadata().GetUid(), Version: tag.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetTag(ctx, tagRef); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("Tag_ImmutableFields", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+		tag := storeTag(t, s, newTestInProgressTag("production", actor))
+
+		tests := []struct {
+			name   string
+			mutate func(*ateapi.Tag)
+		}{
+			{
+				name: "snapshot uri",
+				mutate: func(toUpdate *ateapi.Tag) {
+					toUpdate.Status.Snapshot.DurableSnapshot.Object.SnapshotUri = "gs://private/elsewhere"
+				},
+			},
+			{
+				name: "snapshot content scope",
+				mutate: func(toUpdate *ateapi.Tag) {
+					toUpdate.Status.Snapshot.Fidelity = ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+				},
+			},
+			{
+				name: "clearing the snapshot",
+				mutate: func(toUpdate *ateapi.Tag) {
+					toUpdate.Status.Snapshot = nil
+				},
+			},
+			{
+				name:   "actor template uid",
+				mutate: func(toUpdate *ateapi.Tag) { toUpdate.Status.ActorTemplateUid = "other-template-uid" },
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, store.PreconditionFrom(tag), func(toUpdate *ateapi.Tag) error {
+					tt.mutate(toUpdate)
+					return nil
+				})
+				if !errors.Is(err, store.ErrImmutableField) {
+					t.Errorf("UpdateTag error = %v, want one matching store.ErrImmutableField", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Tag_RecordSnapshotAfterReserve", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+		tagRef := resources.TagRef{Atespace: "team-a", Name: "production"}
+
+		// A tag's snapshot is keyed on the UID the store assigns, so the tag
+		// is reserved without one and the snapshot is recorded by an update.
+		input := newTestInProgressTag(tagRef.Name, actor)
+		pending := input.Status.Snapshot
+		input.Status.Snapshot = nil
+		reserved, err := s.CreateTag(ctx, input)
+		if err != nil {
+			t.Fatalf("CreateTag without a snapshot failed: %v", err)
+		}
+		recorded, err := s.UpdateTag(ctx, tagRef, store.PreconditionFrom(reserved), func(toUpdate *ateapi.Tag) error {
+			toUpdate.Status.Snapshot = proto.CloneOf(pending)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("recording the snapshot of a reserved tag failed: %v", err)
+		}
+		if diff := cmp.Diff(pending, recorded.GetStatus().GetSnapshot(), protocmp.Transform()); diff != "" {
+			t.Errorf("recorded snapshot mismatch (-want +got):\n%s", diff)
+		}
+
+		// Once recorded, the snapshot is fixed like any other.
+		if _, err := s.UpdateTag(ctx, tagRef, store.PreconditionFrom(recorded), func(toUpdate *ateapi.Tag) error {
+			toUpdate.Status.Snapshot.DurableSnapshot.Object.SnapshotUri = "gs://private/elsewhere"
+			return nil
+		}); !errors.Is(err, store.ErrImmutableField) {
+			t.Errorf("rewriting a recorded snapshot = %v, want one matching store.ErrImmutableField", err)
+		}
+	})
+
+	t.Run("CreateTag_ReusedTagName", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+		tagInput := newTestInProgressTag("production", actor)
+		if _, err := s.CreateTag(ctx, tagInput); err != nil {
+			t.Fatalf("CreateTag failed: %v", err)
+		}
+
+		// Create the same tag
+		if _, err := s.CreateTag(ctx, tagInput); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("duplicate CreateTag = %v, want ErrAlreadyExists", err)
+		}
+
+		// Stored row is untouched
+		stored, err := s.GetTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"})
+		if err != nil {
+			t.Fatalf("GetTag failed: %v", err)
+		}
+		if stored.GetMetadata().GetVersion() != 1 {
+			t.Errorf("tag version after rejected create = %d, want 1", stored.GetMetadata().GetVersion())
+		}
+	})
+
+	t.Run("CreateTag_UnknownAtespace", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+
+		tag := newTestInProgressTag("production", actor)
+		tag.Metadata.Atespace = "team-missing"
+		if _, err := s.CreateTag(ctx, tag); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("CreateTag in an unknown atespace = %v, want ErrFailedPrecondition", err)
+		}
+	})
+
+	t.Run("Tag_MalformedSnapshotURI", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+
+		malformed := newTestInProgressTag("production", actor)
+		malformed.Status.Snapshot.DurableSnapshot.Object.SnapshotUri = "gs://private/not-a-snapshot"
+		if _, err := s.CreateTag(ctx, malformed); err == nil {
+			t.Errorf("CreateTag with a malformed snapshot URI succeeded, want an error")
+		}
+
+		input := newTestInProgressTag("staging", actor)
+		input.Status.Snapshot = nil
+		reserved, err := s.CreateTag(ctx, input)
+		if err != nil {
+			t.Fatalf("CreateTag without a snapshot failed: %v", err)
+		}
+		if _, err := s.UpdateTag(ctx, resources.TagRefFromTag(reserved), store.PreconditionFrom(reserved), func(toUpdate *ateapi.Tag) error {
+			toUpdate.Status.Snapshot = proto.CloneOf(malformed.Status.Snapshot)
+			return nil
+		}); err == nil {
+			t.Errorf("recording a malformed snapshot URI succeeded, want an error")
+		}
+	})
+
+	t.Run("UpdateTag_MissingPrecondition", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		actor := seedSuspendedActor(t, s, "team-a", "actor-1")
+		created := storeTag(t, s, newTestInProgressTag("production", actor))
+
+		tests := []struct {
+			name         string
+			precondition store.Precondition
+		}{
+			{
+				name:         "no precondition",
+				precondition: store.Precondition{},
+			},
+			{
+				name:         "guarding on only a uid",
+				precondition: store.Precondition{UID: created.GetMetadata().GetUid()},
+			},
+			{
+				name:         "guarding on only a version",
+				precondition: store.Precondition{Version: created.GetMetadata().GetVersion()},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := s.UpdateTag(ctx, resources.TagRef{Atespace: "team-a", Name: "production"}, tt.precondition, func(toUpdate *ateapi.Tag) error {
+					t.Fatal("mutate ran for a blind write")
+					return nil
+				})
+				if !errors.Is(err, store.ErrPreconditionRequired) {
+					t.Errorf("UpdateTag error = %v, want one matching store.ErrPreconditionRequired", err)
+				}
+			})
+		}
+	})
+
+	t.Run("MarkTagForDeletion", func(t *testing.T) {
+		s := setup(t)
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(context.Background(), newTestSuspendedActor(testAtespace, "actor-1"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		testMarkForDeletion(t, markForDeletionCase[resources.TagRef, *ateapi.Tag]{
+			ref:    resources.TagRef{Atespace: testAtespace, Name: "production"},
+			input:  newTestInProgressTag("production", actor),
+			create: s.CreateTag,
+			get:    s.GetTag,
+			update: s.UpdateTag,
+			mark:   s.MarkTagForDeletion,
+		})
+	})
+
+	t.Run("ListTags_PaginationAndScope", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		for _, atespace := range []string{"team-a", "team-b"} {
+			actor := seedSuspendedActor(t, s, atespace, "actor-1")
+			for i := 0; i < 3; i++ {
+				storeTag(t, s, newTestInProgressTag(fmt.Sprintf("tag-%d", i), actor))
+			}
+		}
+
+		var scoped []*ateapi.Tag
+		for token := ""; ; {
+			page, err := s.ListTags(ctx, "team-a", store.ListOptions{PageSize: 2, PageToken: token})
+			if err != nil {
+				t.Fatalf("scoped ListTags failed: %v", err)
+			}
+			scoped = append(scoped, page.Items...)
+			if page.NextPageToken == "" {
+				break
+			}
+			token = page.NextPageToken
+		}
+		if len(scoped) != 3 {
+			t.Errorf("scoped ListTags returned %d tags, want 3", len(scoped))
+		}
+
+		var global []*ateapi.Tag
+		for token := ""; ; {
+			page, err := s.ListTags(ctx, "", store.ListOptions{PageSize: 2, PageToken: token})
+			if err != nil {
+				t.Fatalf("global ListTags failed: %v", err)
+			}
+			global = append(global, page.Items...)
+			if page.NextPageToken == "" {
+				break
+			}
+			token = page.NextPageToken
+		}
+		if len(global) != 6 {
+			t.Errorf("global ListTags returned %d tags, want 6", len(global))
+		}
+	})
+}
+
+// finalizeTag mutates a reserved tag the way the tag workflow's second
+// transaction does: it marks the pending snapshot storage COMPLETED.
+func finalizeTag(toUpdate *ateapi.Tag) error {
+	toUpdate.Status.Snapshot.DurableSnapshot.State = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+	return nil
+}
+
+// storeTag reserves and finalizes tag, for tests whose subject is a usable tag
+// rather than the two-phase create itself.
+func storeTag(t *testing.T, s store.Interface, tag *ateapi.Tag) *ateapi.Tag {
+	t.Helper()
+	reserved, err := s.CreateTag(context.Background(), tag)
+	if err != nil {
+		t.Fatalf("CreateTag(%q) failed: %v", tag.GetMetadata().GetName(), err)
+	}
+	stored, err := s.UpdateTag(context.Background(), resources.TagRefFromTag(reserved), store.PreconditionFrom(reserved), finalizeTag)
+	if err != nil {
+		t.Fatalf("finalizing tag %q failed: %v", tag.GetMetadata().GetName(), err)
+	}
+	return stored
+}
+
+func runWorkerContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("GetWorker_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		_, err := s.GetWorker(ctx, testWorkerName)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("CreateWorker_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		worker := newTestWorker(testWorkerName, "pod-1")
+		created, err := s.CreateWorker(ctx, worker)
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if diff := cmp.Diff(got, created, protocmp.Transform()); diff != "" {
+			t.Errorf("CreateWorker returned a different worker than it stored (-stored +returned):\n%s", diff)
+		}
+		if got.GetMetadata().GetUid() == "" {
+			t.Errorf("CreateWorker stored an empty uid; want server-assigned uid")
+		}
+		if got.GetMetadata().GetVersion() != 1 {
+			t.Errorf("expected version 1, got %d", got.GetMetadata().GetVersion())
+		}
+		if got.GetMetadata().GetAtespace() != "" {
+			t.Errorf("expected empty atespace, got %q", got.GetMetadata().GetAtespace())
+		}
+		if got.GetMetadata().GetCreateTime() == nil || got.GetMetadata().GetUpdateTime() == nil {
+			t.Errorf("CreateWorker stored unset create/update time")
+		}
+
+		want := proto.Clone(worker).(*ateapi.Worker)
+		want.Metadata.Version = 1
+		if diff := cmp.Diff(want, got, protocmp.Transform(), ignoreUID, ignoreTimestamps); diff != "" {
+			t.Errorf("GetWorker returned unexpected worker (-want +got):\n%s", diff)
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventCreated {
+			t.Errorf("expected WorkerEventCreated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(got, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("created event worker mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("CreateWorker_AlreadyExists", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		worker := newTestWorker(testWorkerName, "pod-1")
+		if _, err := s.CreateWorker(ctx, worker); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		if _, err := s.CreateWorker(ctx, worker); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("expected ErrAlreadyExists, got %v", err)
+		}
+	})
+
+	t.Run("UpdateWorker_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		worker := newTestWorker(testWorkerName, "pod-1")
+		created, err := s.CreateWorker(ctx, worker)
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		// Subscribe after create so the create event doesn't pollute the channel.
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		updated, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(created), func(toUpdate *ateapi.Worker) error {
+			toUpdate.Status.State = ateapi.WorkerState_WORKER_STATE_DRAINING
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateWorker failed: %v", err)
+		}
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if diff := cmp.Diff(got, updated, protocmp.Transform()); diff != "" {
+			t.Errorf("UpdateWorker returned a different worker than it stored (-stored +returned):\n%s", diff)
+		}
+		if got.GetMetadata().GetVersion() != 2 {
+			t.Errorf("expected version 2, got %d", got.GetMetadata().GetVersion())
+		}
+
+		want := proto.Clone(worker).(*ateapi.Worker)
+		want.Status.State = ateapi.WorkerState_WORKER_STATE_DRAINING
+		want.Metadata.Version = 2
+		if diff := cmp.Diff(want, got, protocmp.Transform(), ignoreUID, ignoreTimestamps); diff != "" {
+			t.Errorf("UpdateWorker yielded unexpected state in DB (-want +got):\n%s", diff)
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventUpdated {
+			t.Errorf("expected WorkerEventUpdated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(got, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("updated event worker mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("UpdateWorker_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		// A well-formed precondition, so it is the missing worker rather than the
+		// guard that decides the error.
+		precondition := store.Precondition{UID: otherTestWorkerName, Version: 1}
+		_, err := s.UpdateWorker(ctx, testWorkerName, precondition, func(*ateapi.Worker) error {
+			t.Error("mutate ran for a worker that does not exist")
+			return nil
+		})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("UpdateWorker_MissingPrecondition", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		created, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		for _, tt := range []struct {
+			name         string
+			precondition store.Precondition
+		}{
+			{"no precondition", store.Precondition{}},
+			{"guarding on only a uid", store.Precondition{UID: created.GetMetadata().GetUid()}},
+			{"guarding on only a version", store.Precondition{Version: created.GetMetadata().GetVersion()}},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := s.UpdateWorker(ctx, testWorkerName, tt.precondition, func(*ateapi.Worker) error {
+					t.Error("mutate ran for a blind write")
+					return nil
+				})
+				if !errors.Is(err, store.ErrPreconditionRequired) {
+					t.Errorf("UpdateWorker error = %v, want one matching store.ErrPreconditionRequired", err)
+				}
+			})
+		}
+	})
+
+	t.Run("MarkWorkerForDeletion", func(t *testing.T) {
+		s := setup(t)
+		testMarkForDeletion(t, markForDeletionCase[string, *ateapi.Worker]{
+			ref:    testWorkerName,
+			input:  newTestWorker(testWorkerName, "pod-1"),
+			create: s.CreateWorker,
+			get:    s.GetWorker,
+			update: s.UpdateWorker,
+			mark:   s.MarkWorkerForDeletion,
+			mutate: func(toUpdate *ateapi.Worker) error {
+				toUpdate.Status = &ateapi.WorkerStatus{State: ateapi.WorkerState_WORKER_STATE_DRAINING}
+				return nil
+			},
+			mutated: func(marked *ateapi.Worker) bool {
+				return marked.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_DRAINING
+			},
+		})
+	})
+
+	// A mark publishes the marked worker like any other update.
+	t.Run("MarkWorkerForDeletion_Event", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		// Subscribed here so only the mark's event is on the channel.
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		marked, err := s.MarkWorkerForDeletion(ctx, testWorkerName, store.DeletePreconditions{}, nil)
+		if err != nil {
+			t.Fatalf("mark failed: %v", err)
+		}
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventUpdated {
+			t.Errorf("expected WorkerEventUpdated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(marked, event.Worker, protocmp.Transform()); diff != "" {
+			t.Errorf("mark event worker mismatch (-marked +event):\n%s", diff)
+		}
+	})
+
+	// A worker name is a pod UID, so a name is only reused when the same pod is
+	// re-registered. The store still hands out a fresh uid, and a guard naming
+	// the old one must not reach the new incarnation.
+	t.Run("UpdateWorker_UIDConflict", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		original, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		if _, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteWorker failed: %v", err)
+		}
+		recreated, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("recreate CreateWorker failed: %v", err)
+		}
+		if recreated.GetMetadata().GetUid() == original.GetMetadata().GetUid() {
+			t.Fatalf("recreated worker reused uid %s, want a fresh one", recreated.GetMetadata().GetUid())
+		}
+
+		_, err = s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(original), func(toUpdate *ateapi.Worker) error {
+			t.Error("mutate ran past its precondition once the guarded incarnation was gone")
+			toUpdate.Labels = map[string]string{"tier": "edited-anyway"}
+			return nil
+		})
+		if !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("UpdateWorker error = %v, want one matching store.ErrUIDConflict", err)
+		}
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if diff := cmp.Diff(recreated, got, protocmp.Transform()); diff != "" {
+			t.Errorf("rejected update changed the stored worker (-recreated +got):\n%s", diff)
+		}
+	})
+
+	t.Run("UpdateWorker_Conflict", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		// Both readers observe version 1; the first update moves the worker
+		// past it, so the second one's precondition can no longer hold.
+		observed, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if _, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(observed), func(toUpdate *ateapi.Worker) error {
+			toUpdate.Status.State = ateapi.WorkerState_WORKER_STATE_DRAINING
+			return nil
+		}); err != nil {
+			t.Fatalf("UpdateWorker failed: %v", err)
+		}
+
+		_, err = s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(observed), func(toUpdate *ateapi.Worker) error {
+			toUpdate.Status.State = ateapi.WorkerState_WORKER_STATE_ACTIVE
+			return nil
+		})
+		if !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("expected ErrVersionConflict, got %v", err)
+		}
+	})
+
+	// A mutation that reports an error leaves the worker exactly as it was, at
+	// the version it was already at. Callers depend on this to report "already
+	// in the desired state" without a write: DrainWorker on a worker already
+	// DRAINING, and the in-process release of a worker that is not assigned.
+	t.Run("UpdateWorker_MutateError", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		created, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		sentinel := errors.New("nothing to do")
+		_, err = s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(created), func(toUpdate *ateapi.Worker) error {
+			toUpdate.Labels = map[string]string{"tier": "edited-anyway"}
+			return sentinel
+		})
+		if !errors.Is(err, sentinel) {
+			t.Errorf("expected the mutate's error verbatim, got %v", err)
+		}
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if len(got.GetLabels()) != 0 {
+			t.Errorf("aborted mutation was written: labels are %v", got.GetLabels())
+		}
+		if got.GetMetadata().GetVersion() != 1 {
+			t.Errorf("aborted mutation bumped the version to %d, want 1", got.GetMetadata().GetVersion())
+		}
+	})
+
+	// Claimants that all observed the same free worker must not all win. Two
+	// things keep that true and this exercises both: the precondition rejects
+	// every claimant whose read the winner has since invalidated, and the
+	// occupancy test inside mutate runs against the state the write lands on
+	// rather than the state the claimant read.
+	t.Run("UpdateWorker_ConcurrentAssign", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		created, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		const claimants = 8
+		errTaken := errors.New("already assigned")
+		var wg sync.WaitGroup
+		won := make([]bool, claimants)
+		for i := range claimants {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Claimants contend over the allocation total, which is what a
+				// claim actually moves on the Worker record now that the
+				// assignments themselves are separate records. The cpu limit carries
+				// the claimant's number so the winner is identifiable.
+				_, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(created), func(toUpdate *ateapi.Worker) error {
+					if toUpdate.GetStatus().GetAllocated().GetActors() > 0 {
+						return errTaken
+					}
+					toUpdate.Status.Allocated = &ateapi.WorkerResources{Actors: 1, CpuMillicores: int64(i) + 1, MemoryBytes: 0}
+					return nil
+				})
+				switch {
+				case err == nil:
+					won[i] = true
+				case errors.Is(err, errTaken), errors.Is(err, store.ErrVersionConflict):
+				default:
+					t.Errorf("claimant %d: unexpected error %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+
+		winners := 0
+		for _, w := range won {
+			if w {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Fatalf("%d of %d claimants won the assignment, want exactly 1", winners, claimants)
+		}
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if n := got.GetStatus().GetAllocated().GetActors(); n < 1 || n > int32(claimants) {
+			t.Errorf("stored claim names %d, want one of the claimants", n)
+		}
+		// One winning write on top of the create, and no partial ones.
+		if got.GetMetadata().GetVersion() != 2 {
+			t.Errorf("worker is at version %d, want 2 (create plus the single winning assign)", got.GetMetadata().GetVersion())
+		}
+	})
+
+	t.Run("DeleteWorker", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		created, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		deleted, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteWorker failed: %v", err)
+		}
+		if diff := cmp.Diff(created, deleted, protocmp.Transform()); diff != "" {
+			t.Errorf("DeleteWorker returned something other than what it removed (-want +got):\n%s", diff)
+		}
+		if _, err := s.GetWorker(ctx, testWorkerName); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound after delete, got %v", err)
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventDeleted {
+			t.Errorf("expected WorkerEventDeleted, got %v", event.Type)
+		}
+		if name := event.Worker.GetMetadata().GetName(); name != testWorkerName {
+			t.Errorf("deleted event named %q, want %q", name, testWorkerName)
+		}
+	})
+
+	// Absence is reported, not swallowed. Deletes of Workers used to succeed
+	// silently, unlike every other Delete on the interface; callers that want
+	// re-drivable cleanup treat ErrNotFound as success themselves.
+	t.Run("DeleteWorker_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound deleting a missing worker, got %v", err)
+		}
+	})
+
+	t.Run("DeleteWorker_Preconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		create := func() *ateapi.Worker {
+			created, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+			if err != nil {
+				t.Fatalf("CreateWorker failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteWorker(ctx, testWorkerName, precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing worker = %v, want ErrNotFound", err)
+		}
+
+		worker := create()
+		uid, version := worker.GetMetadata().GetUid(), worker.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetWorker(ctx, testWorkerName); err != nil {
+			t.Fatalf("a refused delete removed the worker: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		worker = create()
+		if err := del(store.DeletePreconditions{UID: worker.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		worker = create()
+		if err := del(store.DeletePreconditions{UID: worker.GetMetadata().GetUid(), Version: worker.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetWorker(ctx, testWorkerName); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("WatchWorkers_ClosedOnClose", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		watch.Close()
+
+		select {
+		case _, ok := <-watch.Events:
+			if ok {
+				t.Errorf("expected Events to be closed after Close, got an event")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for Events to close after Close")
+		}
+	})
+
+	t.Run("ListWorkers", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod1")); err != nil {
+			t.Fatalf("failed to create worker1: %v", err)
+		}
+		if _, err := s.CreateWorker(ctx, newTestWorker(otherTestWorkerName, "pod2")); err != nil {
+			t.Fatalf("failed to create worker2: %v", err)
+		}
+
+		workersResp, err := s.ListWorkers(ctx, store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListWorkers failed: %v", err)
+		}
+		workers := workersResp.Items
+		if len(workers) != 2 {
+			t.Errorf("expected 2 workers, got %d", len(workers))
+		}
+
+		found1, found2 := false, false
+		for _, w := range workers {
+			if w.GetWorkerPod() == "pod1" {
+				found1 = true
+			}
+			if w.GetWorkerPod() == "pod2" {
+				found2 = true
+			}
+		}
+		if !found1 || !found2 {
+			t.Errorf("did not find all workers: found1=%t, found2=%t", found1, found2)
+		}
+	})
+
+	t.Run("ListWorkers_Empty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		workersResp, err := s.ListWorkers(ctx, store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListWorkers failed: %v", err)
+		}
+		if len(workersResp.Items) != 0 {
+			t.Errorf("expected 0 workers, got %d", len(workersResp.Items))
+		}
+	})
+
+	t.Run("ListWorkers_Pagination", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		for i := 0; i < 5; i++ {
+			worker := newTestWorker(fmt.Sprintf("bb2e6a1c-0000-4000-8000-00000000000%d", i), fmt.Sprintf("pod%d", i))
+			if _, err := s.CreateWorker(ctx, worker); err != nil {
+				t.Fatalf("failed to create worker %d: %v", i, err)
+			}
+		}
+
+		var allWorkers []*ateapi.Worker
+		pageToken := ""
+		for {
+			page, err := s.ListWorkers(ctx, store.ListOptions{PageSize: 2, PageToken: pageToken})
+			if err != nil {
+				t.Fatalf("ListWorkers failed: %v", err)
+			}
+			allWorkers = append(allWorkers, page.Items...)
+			pageToken = page.NextPageToken
+			if pageToken == "" {
+				break
+			}
+		}
+
+		if len(allWorkers) != 5 {
+			t.Fatalf("expected 5 workers total, got %d", len(allWorkers))
+		}
+		seen := make(map[string]bool)
+		for _, w := range allWorkers {
+			if seen[w.GetWorkerPod()] {
+				t.Errorf("duplicate worker found in paginated results: %s", w.GetWorkerPod())
+			}
+			seen[w.GetWorkerPod()] = true
+		}
+	})
+}
+
+// runWorkerAssignmentContractTests covers the records that say which Actors a
+// Worker hosts, and the allocation total that has to move with them.
+func runWorkerAssignmentContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	// newTestAssignment stores the Actor named after key, unless an earlier call
+	// stored it, and describes its placement, sized so that a total over several
+	// of them is unambiguous about which were counted.
+	newTestAssignment := func(t *testing.T, s store.Interface, key string, cpuMilli, memoryBytes int64) *ateapi.ActorAssignment {
+		t.Helper()
+		ctx := context.Background()
+		ref := resources.ActorRef{Atespace: testAtespace, Name: "actor-" + key}
+		actor, err := s.GetActor(ctx, ref)
+		if errors.Is(err, store.ErrNotFound) {
+			if _, err := s.CreateAtespace(ctx, newTestAtespace(testAtespace)); err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+				t.Fatalf("CreateAtespace failed: %v", err)
+			}
+			actor, err = s.CreateActor(ctx, newTestSuspendedActor(testAtespace, ref.Name))
+		}
+		if err != nil {
+			t.Fatalf("storing actor %s failed: %v", ref, err)
+		}
+		return &ateapi.ActorAssignment{
+			Actor:     &ateapi.ObjectRef{Atespace: ref.Atespace, Name: ref.Name},
+			ActorUid:  actor.GetMetadata().GetUid(),
+			Resources: resources.CPUMemory(cpuMilli, memoryBytes),
+		}
+	}
+
+	// bindWith binds assignment against its Actor as last stored, leaving the
+	// Actor as it was but for its version.
+	bindWith := func(ctx context.Context, s store.Interface, workerName string, assignment *ateapi.ActorAssignment, admit func(*ateapi.Worker) error) error {
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			return err
+		}
+		_, err = s.BindActorToWorker(ctx, workerName, assignment, admit, ref, store.PreconditionFrom(actor), nil)
+		return err
+	}
+
+	// bind binds one assignment with no admission check, for the tests that care
+	// about the outcome rather than about admission.
+	bind := func(t *testing.T, s store.Interface, workerName string, assignment *ateapi.ActorAssignment) {
+		t.Helper()
+		if err := bindWith(context.Background(), s, workerName, assignment, nil); err != nil {
+			t.Fatalf("BindActorToWorker(%s) failed: %v", assignment.GetActorUid(), err)
+		}
+	}
+
+	// release releases assignment's Actor against the Actor as last stored,
+	// leaving it as it was but for its version.
+	release := func(t *testing.T, s store.Interface, assignment *ateapi.ActorAssignment) {
+		t.Helper()
+		ctx := context.Background()
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor(%s) failed: %v", ref, err)
+		}
+		if _, err := s.UpdateActorAndRelease(ctx, ref, store.PreconditionFrom(actor), nil); err != nil {
+			t.Fatalf("UpdateActorAndRelease(%s) failed: %v", ref, err)
+		}
+	}
+
+	t.Run("BindActorToWorker_AddsAssignmentAndAllocation", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		bind(t, s, testWorkerName, assignment)
+
+		got, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid())
+		if err != nil {
+			t.Fatalf("GetWorkerAssignment failed: %v", err)
+		}
+		if diff := cmp.Diff(assignment, got, protocmp.Transform()); diff != "" {
+			t.Errorf("stored assignment mismatch (-want +got):\n%s", diff)
+		}
+
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		want := &ateapi.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
+		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("allocated mismatch (-want +got):\n%s", diff)
+		}
+		if worker.GetMetadata().GetVersion() != 2 {
+			t.Errorf("worker version = %d, want 2: a bind advances the worker", worker.GetMetadata().GetVersion())
+		}
+
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventUpdated {
+			t.Errorf("expected WorkerEventUpdated, got %v", event.Type)
+		}
+		if diff := cmp.Diff(want, event.Worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("event allocated mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	// A bound Actor is bound once. A second bind against the Actor as it now
+	// stands, even onto the same Worker, is refused and leaves the first
+	// booking and the Actor as they were.
+	t.Run("BindActorToWorker_AlreadyBound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		bind(t, s, testWorkerName, assignment)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		bound, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		err = bindWith(ctx, s, testWorkerName, newTestAssignment(t, s, "1", 250, 1<<21), nil)
+		if err == nil || errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("binding a bound actor again = %v, want an error other than ErrVersionConflict", err)
+		}
+		after, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if got, want := after.GetMetadata().GetVersion(), bound.GetMetadata().GetVersion(); got != want {
+			t.Errorf("actor version = %d after the refused bind, want %d", got, want)
+		}
+
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		want := &ateapi.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
+		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("allocated mismatch after a refused second bind (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("BindActorToWorker_RefusedAdmissionLeavesNothingBehind", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		full := errors.New("worker is full")
+		assignment := newTestAssignment(t, s, "1", 500, 0)
+		err := bindWith(ctx, s, testWorkerName, assignment, func(*ateapi.Worker) error { return full })
+		if !errors.Is(err, full) {
+			t.Errorf("BindActorToWorker with a refusing admit = %v, want %v", err, full)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("a refused bind left an assignment behind: %v", err)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := worker.GetStatus().GetAllocated().GetActors(); got != 0 {
+			t.Errorf("a refused bind left %d actors allocated, want 0", got)
+		}
+	})
+
+	// What the caller needs from admission: it runs against the Worker as the
+	// bind will write it, so concurrent binds cannot both find room for the last
+	// place. Nothing outside the store can offer that -- a check made before the
+	// call is stale by the time it commits.
+	t.Run("BindActorToWorker_AdmitSeesConcurrentBinds", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		const claims = 16
+		full := errors.New("worker is full")
+		roomForOne := func(w *ateapi.Worker) error {
+			if w.GetStatus().GetAllocated().GetActors() >= 1 {
+				return full
+			}
+			return nil
+		}
+
+		assignments := make([]*ateapi.ActorAssignment, claims)
+		for i := range claims {
+			assignments[i] = newTestAssignment(t, s, fmt.Sprint(i), 0, 0)
+		}
+		var wg sync.WaitGroup
+		won := make([]bool, claims)
+		for i := range claims {
+			wg.Go(func() {
+				won[i] = bindWith(ctx, s, testWorkerName, assignments[i], roomForOne) == nil
+			})
+		}
+		wg.Wait()
+
+		var winners int
+		for _, w := range won {
+			if w {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Errorf("%d of %d concurrent binds were admitted, want exactly 1", winners, claims)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := worker.GetStatus().GetAllocated().GetActors(); got != 1 {
+			t.Errorf("worker allocation counts %d actors, want 1", got)
+		}
+	})
+
+	// An Actor belongs to one Worker. A second Worker claiming it must be
+	// refused rather than quietly taking the row, or the first goes on counting
+	// an Actor it does not host and never gets that capacity back.
+	t.Run("BindActorToWorker_ActorAlreadyOnAnotherWorker", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		for _, name := range []string{testWorkerName, otherTestWorkerName} {
+			if _, err := s.CreateWorker(ctx, newTestWorker(name, "pod-"+name)); err != nil {
+				t.Fatalf("CreateWorker(%s) failed: %v", name, err)
+			}
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		bind(t, s, testWorkerName, assignment)
+
+		other, err := s.GetWorker(ctx, otherTestWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if err := bindWith(ctx, s, otherTestWorkerName, newTestAssignment(t, s, "1", 500, 1<<20), nil); err == nil {
+			t.Fatal("BindActorToWorker onto a second worker succeeded, want an error")
+		}
+
+		// The refusal has to leave both Workers exactly as they were: the first
+		// still hosting the Actor and counting it, the second counting nothing.
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); err != nil {
+			t.Errorf("GetWorkerAssignment on the first worker = %v, want the actor left there", err)
+		}
+		first, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		want := &ateapi.WorkerResources{Actors: 1, CpuMillicores: 500, MemoryBytes: 1 << 20}
+		if diff := cmp.Diff(want, first.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("first worker's allocation changed (-want +got):\n%s", diff)
+		}
+		refused, err := s.GetWorker(ctx, otherTestWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := refused.GetStatus().GetAllocated().GetActors(); got != 0 {
+			t.Errorf("refused worker counts %d actors, want 0", got)
+		}
+		if got, wantVersion := refused.GetMetadata().GetVersion(), other.GetMetadata().GetVersion(); got != wantVersion {
+			t.Errorf("refused worker moved to version %d, want %d unchanged", got, wantVersion)
+		}
+	})
+
+	// The same rule under contention, which is where it is actually decided.
+	// Two replicas resuming one Actor pick different Workers and claim at the
+	// same moment; a backend that decides on a read taken before the competing
+	// write exists lets both through, and the loser is left counting an Actor
+	// whose row went elsewhere.
+	t.Run("BindActorToWorker_ConcurrentClaimsOfOneActor", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		names := []string{testWorkerName, otherTestWorkerName}
+		versions := make([]int64, len(names))
+		for i, name := range names {
+			created, err := s.CreateWorker(ctx, newTestWorker(name, "pod-"+name))
+			if err != nil {
+				t.Fatalf("CreateWorker(%s) failed: %v", name, err)
+			}
+			versions[i] = created.GetMetadata().GetVersion()
+		}
+
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		actor, err := s.GetActor(ctx, resources.ActorRefFromObjectRef(assignment.GetActor()))
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		var start sync.WaitGroup
+		start.Add(1)
+		var wg sync.WaitGroup
+		won := make([]bool, len(names))
+		for i, name := range names {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start.Wait()
+				// Both claims read the same Actor, as two replicas would.
+				_, err := s.BindActorToWorker(ctx, name, proto.CloneOf(assignment), nil, resources.ActorRefFromActor(actor), store.PreconditionFrom(actor), nil)
+				won[i] = err == nil
+			}()
+		}
+		start.Done()
+		wg.Wait()
+
+		if winners := len(slices.DeleteFunc(slices.Clone(won), func(w bool) bool { return !w })); winners != 1 {
+			t.Errorf("%d of %d claims won the actor, want exactly 1", winners, len(names))
+		}
+		// Whoever won, no Worker may count an Actor it does not hold.
+		for _, name := range names {
+			worker, err := s.GetWorker(ctx, name)
+			if err != nil {
+				t.Fatalf("GetWorker(%s) failed: %v", name, err)
+			}
+			assignmentsPage, err := s.ListWorkerAssignments(ctx, name, store.ListOptions{})
+			if err != nil {
+				t.Fatalf("ListWorkerAssignments(%s) failed: %v", name, err)
+			}
+			assignments := assignmentsPage.Items
+			want := resources.SumAllocated(assignments)
+			// A Worker that never took anything has no allocation at all, while
+			// a sum over no assignments is a zeroed message; the two say the
+			// same thing, so compare what they mean rather than the messages.
+			got := worker.GetStatus().GetAllocated()
+			if !sameAllocation(got, want) {
+				t.Errorf("%s: allocation %v disagrees with the %d assignments it holds (%v)",
+					name, got, len(assignments), want)
+			}
+		}
+	})
+
+	t.Run("BindActorToWorker_WorkerNotFound", func(t *testing.T) {
+		s := setup(t)
+		err := bindWith(context.Background(), s, "no-such-worker", newTestAssignment(t, s, "1", 0, 0), nil)
+		if !errors.Is(err, store.ErrWorkerNotFound) {
+			t.Errorf("BindActorToWorker on a missing worker = %v, want ErrWorkerNotFound", err)
+		}
+	})
+
+	t.Run("BindActorToWorker_ActorNotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 0, 0)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, ref, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActor failed: %v", err)
+		}
+
+		_, err = s.BindActorToWorker(ctx, testWorkerName, assignment, nil, ref, store.PreconditionFrom(actor), nil)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("BindActorToWorker of a deleted actor = %v, want ErrNotFound", err)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetWorkerAssignment after the failed bind = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpdateActorAndRelease_LeavesOtherAssignments", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		first := newTestAssignment(t, s, "1", 500, 1<<20)
+		second := newTestAssignment(t, s, "2", 250, 1<<21)
+		bind(t, s, testWorkerName, first)
+		bind(t, s, testWorkerName, second)
+
+		release(t, s, first)
+
+		// Only the released Actor goes; the Worker's others are untouched.
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, first.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("released assignment is still readable: %v", err)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, second.GetActorUid()); err != nil {
+			t.Errorf("releasing one actor disturbed another: %v", err)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		want := &ateapi.WorkerResources{Actors: 1, CpuMillicores: 250, MemoryBytes: 1 << 21}
+		if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+			t.Errorf("allocated mismatch after release (-want +got):\n%s", diff)
+		}
+	})
+
+	// The Actor and its assignment commit together, so a bind whose Actor update
+	// fails leaves neither written.
+	t.Run("BindActorToWorker_ActorConflictLeavesNothingBehind", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		stale, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		current, err := s.UpdateActor(ctx, ref, store.PreconditionFrom(stale), nil)
+		if err != nil {
+			t.Fatalf("UpdateActor failed: %v", err)
+		}
+
+		_, err = s.BindActorToWorker(ctx, testWorkerName, assignment, nil, ref, store.PreconditionFrom(stale), func(a *ateapi.Actor) error {
+			a.Status.State = ateapi.ActorState_ACTOR_STATE_RESUMING
+			return nil
+		})
+		if !errors.Is(err, store.ErrVersionConflict) {
+			t.Fatalf("BindActorToWorker under a stale precondition = %v, want ErrVersionConflict", err)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetWorkerAssignment after the failed bind = %v, want ErrNotFound", err)
+		}
+		after, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got, want := after.GetMetadata().GetVersion(), worker.GetMetadata().GetVersion(); got != want {
+			t.Errorf("worker version = %d after the failed bind, want %d", got, want)
+		}
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if got, want := actor.GetMetadata().GetVersion(), current.GetMetadata().GetVersion(); got != want {
+			t.Errorf("actor version = %d after the failed bind, want %d", got, want)
+		}
+	})
+
+	t.Run("BindActorToWorker_UpdatesActor", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		updated, err := s.BindActorToWorker(ctx, testWorkerName, assignment, nil, ref, store.PreconditionFrom(actor), func(a *ateapi.Actor) error {
+			a.Status.State = ateapi.ActorState_ACTOR_STATE_RESUMING
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("BindActorToWorker failed: %v", err)
+		}
+		stored, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if diff := cmp.Diff(stored, updated, protocmp.Transform()); diff != "" {
+			t.Errorf("returned actor differs from the stored one (-stored +returned):\n%s", diff)
+		}
+		if got := stored.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_RESUMING {
+			t.Errorf("actor state = %v, want RESUMING", got)
+		}
+	})
+
+	t.Run("UpdateActorAndRelease_ReleasesAndUpdates", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		bind(t, s, testWorkerName, assignment)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+
+		updated, err := s.UpdateActorAndRelease(ctx, ref, store.PreconditionFrom(actor), func(a *ateapi.Actor) error {
+			a.Status.State = ateapi.ActorState_ACTOR_STATE_CRASHED
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateActorAndRelease failed: %v", err)
+		}
+		if got := updated.GetStatus().GetState(); got != ateapi.ActorState_ACTOR_STATE_CRASHED {
+			t.Errorf("returned actor state = %v, want CRASHED", got)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := worker.GetStatus().GetAllocated().GetActors(); got != 0 {
+			t.Errorf("worker counts %d actors after the release, want 0", got)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetWorkerAssignment after the release = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpdateActorAndRelease_ActorConflictKeepsAssignment", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 500, 1<<20)
+		bind(t, s, testWorkerName, assignment)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		stale, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		if _, err := s.UpdateActor(ctx, ref, store.PreconditionFrom(stale), nil); err != nil {
+			t.Fatalf("UpdateActor failed: %v", err)
+		}
+
+		if _, err := s.UpdateActorAndRelease(ctx, ref, store.PreconditionFrom(stale), nil); !errors.Is(err, store.ErrVersionConflict) {
+			t.Fatalf("UpdateActorAndRelease under a stale precondition = %v, want ErrVersionConflict", err)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); err != nil {
+			t.Errorf("GetWorkerAssignment after the failed release = %v, want the assignment kept", err)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := worker.GetStatus().GetAllocated().GetActors(); got != 1 {
+			t.Errorf("worker counts %d actors after the failed release, want 1", got)
+		}
+	})
+
+	// Release runs on paths that retry, so a pass that finds nothing to release
+	// still updates the Actor, and leaves the Workers alone.
+	t.Run("UpdateActorAndRelease_NothingBound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		worker, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1"))
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 0, 0)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		updated, err := s.UpdateActorAndRelease(ctx, ref, store.PreconditionFrom(actor), nil)
+		if err != nil {
+			t.Fatalf("UpdateActorAndRelease failed: %v", err)
+		}
+		if got, want := updated.GetMetadata().GetVersion(), actor.GetMetadata().GetVersion()+1; got != want {
+			t.Errorf("actor version = %d, want %d", got, want)
+		}
+		after, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got, want := after.GetMetadata().GetVersion(), worker.GetMetadata().GetVersion(); got != want {
+			t.Errorf("worker version moved from %d to %d on a release that freed nothing", want, got)
+		}
+	})
+
+	t.Run("ListWorkerAssignments_ScopedToOneWorker", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		for _, pod := range []string{"pod-1", "pod-2"} {
+			if _, err := s.CreateWorker(ctx, newTestWorker("worker-"+pod, pod)); err != nil {
+				t.Fatalf("CreateWorker failed: %v", err)
+			}
+		}
+		first := newTestAssignment(t, s, "1", 0, 0)
+		second := newTestAssignment(t, s, "2", 0, 0)
+		third := newTestAssignment(t, s, "3", 0, 0)
+		bind(t, s, "worker-pod-1", first)
+		bind(t, s, "worker-pod-1", second)
+		bind(t, s, "worker-pod-2", third)
+
+		assignmentsPage, err := s.ListWorkerAssignments(ctx, "worker-pod-1", store.ListOptions{})
+		if err != nil {
+			t.Fatalf("ListWorkerAssignments failed: %v", err)
+		}
+		assignments := assignmentsPage.Items
+		var got []string
+		for _, assignment := range assignments {
+			got = append(got, assignment.GetActorUid())
+		}
+		// Listed in actor UID order.
+		want := []string{first.GetActorUid(), second.GetActorUid()}
+		slices.Sort(want)
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("assignments of worker-pod-1 (-want +got):\n%s", diff)
+		}
+
+		// An Actor is hosted by one Worker, and only that Worker's list has it.
+		if _, err := s.GetWorkerAssignment(ctx, "worker-pod-1", third.GetActorUid()); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("GetWorkerAssignment found another worker's actor: %v", err)
+		}
+	})
+
+	// A Worker holds far more Actors than a page, so a caller that stops at the
+	// first page sees an arbitrary subset. Walking the token must yield each
+	// assignment exactly once.
+	t.Run("ListWorkerAssignments_Paginates", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		const total = 5
+		for i := range total {
+			bind(t, s, testWorkerName, newTestAssignment(t, s, fmt.Sprint(i), 1, 1))
+		}
+
+		seen := map[string]int{}
+		pages := 0
+		for token := ""; ; pages++ {
+			page, err := s.ListWorkerAssignments(ctx, testWorkerName, store.ListOptions{PageSize: 2, PageToken: token})
+			if err != nil {
+				t.Fatalf("ListWorkerAssignments page %d failed: %v", pages, err)
+			}
+			if got := len(page.Items); got > 2 {
+				t.Fatalf("page %d returned %d assignments, want at most the requested 2", pages, got)
+			}
+			for _, a := range page.Items {
+				seen[a.GetActorUid()]++
+			}
+			if !page.HasNextPage() {
+				break
+			}
+			token = page.NextPageToken
+		}
+		if len(seen) != total {
+			t.Errorf("walking the pages saw %d distinct assignments, want %d", len(seen), total)
+		}
+		for uid, n := range seen {
+			if n != 1 {
+				t.Errorf("assignment %s appeared %d times across pages, want once", uid, n)
+			}
+		}
+	})
+
+	t.Run("ListWorkerAssignments_Empty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignmentsPage, err := s.ListWorkerAssignments(ctx, testWorkerName, store.ListOptions{})
+		if err != nil {
+			t.Fatalf("ListWorkerAssignments failed: %v", err)
+		}
+		assignments := assignmentsPage.Items
+		if len(assignments) != 0 {
+			t.Errorf("an idle worker reported %d assignments, want 0", len(assignments))
+		}
+	})
+
+	// Deleting a Worker or an Actor while an assignment joins them would leave
+	// the Actor naming a Worker that is gone, or the Worker booking an Actor
+	// that is gone.
+	t.Run("DeleteWorker_RefusesWhileAssigned", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 0, 0)
+		bind(t, s, testWorkerName, assignment)
+		if _, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("DeleteWorker of an assigned worker = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.GetWorkerAssignment(ctx, testWorkerName, assignment.GetActorUid()); err != nil {
+			t.Fatalf("GetWorkerAssignment after the refused delete failed: %v", err)
+		}
+
+		release(t, s, assignment)
+		if _, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteWorker after release failed: %v", err)
+		}
+	})
+
+	t.Run("DeleteActor_RefusesWhileAssigned", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		assignment := newTestAssignment(t, s, "1", 0, 0)
+		ref := resources.ActorRefFromObjectRef(assignment.GetActor())
+		actor, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		// DeleteActor reads the Actor's status, so the bind has to set it.
+		bound, err := s.BindActorToWorker(ctx, testWorkerName, assignment, nil, ref, store.PreconditionFrom(actor), func(toUpdate *ateapi.Actor) error {
+			toUpdate.Status.WorkerAssignment = &ateapi.WorkerAssignment{Worker: &ateapi.ObjectRef{Name: testWorkerName}}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("BindActorToWorker failed: %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, ref, store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("DeleteActor of an assigned actor = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.GetActor(ctx, ref); err != nil {
+			t.Fatalf("GetActor after the refused delete failed: %v", err)
+		}
+
+		if _, err := s.UpdateActorAndRelease(ctx, ref, store.PreconditionFrom(bound), func(toUpdate *ateapi.Actor) error {
+			toUpdate.Status.WorkerAssignment = nil
+			return nil
+		}); err != nil {
+			t.Fatalf("UpdateActorAndRelease failed: %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, ref, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActor after release failed: %v", err)
+		}
+	})
+
+	// TestAllocatedTracksAssignmentsUnderChurn is the test a stored total needs,
+	// because the risk of storing one is not that the arithmetic is wrong once
+	// -- it is that some sequence of binds and releases leaves it disagreeing
+	// with what it summarizes, quietly, forever after.
+	//
+	// So: churn a worker through hundreds of binds and releases, at varying
+	// sizes, and after every one require the total to equal the assignments.
+	t.Run("Allocated_TracksAssignmentsUnderChurn", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateWorker(ctx, newTestWorker(testWorkerName, "pod-1")); err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+
+		// Deterministic, so a failure reproduces.
+		rng := rand.New(rand.NewPCG(1, 2))
+		bound := map[string]bool{}
+		for step := range 300 {
+			key := fmt.Sprint(rng.IntN(12))
+			assignment := newTestAssignment(t, s, key, int64(rng.IntN(4)+1)*500, int64(rng.IntN(4)+1)<<24)
+			actorUID := assignment.GetActorUid()
+
+			if bound[key] {
+				release(t, s, assignment)
+			} else {
+				bind(t, s, testWorkerName, assignment)
+			}
+			bound[key] = !bound[key]
+
+			worker, err := s.GetWorker(ctx, testWorkerName)
+			if err != nil {
+				t.Fatalf("GetWorker failed: %v", err)
+			}
+			assignmentsPage, err := s.ListWorkerAssignments(ctx, testWorkerName, store.ListOptions{})
+			if err != nil {
+				t.Fatalf("ListWorkerAssignments failed: %v", err)
+			}
+			assignments := assignmentsPage.Items
+			want := resources.SumAllocated(assignments)
+			if diff := cmp.Diff(want, worker.GetStatus().GetAllocated(), protocmp.Transform()); diff != "" {
+				t.Fatalf("after step %d (actor %s) the total no longer matches the assignments (-want +got):\n%s", step, actorUID, diff)
+			}
+		}
+
+		// And it must come back to exactly zero, not merely to something small:
+		// a total drifting by a little per cycle is what this guards against.
+		assignmentsPage, err := s.ListWorkerAssignments(ctx, testWorkerName, store.ListOptions{})
+		if err != nil {
+			t.Fatalf("ListWorkerAssignments failed: %v", err)
+		}
+		assignments := assignmentsPage.Items
+		for _, assignment := range assignments {
+			release(t, s, assignment)
+		}
+		worker, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		if got := worker.GetStatus().GetAllocated(); got.GetActors() != 0 || got.GetCpuMillicores() != 0 || got.GetMemoryBytes() != 0 {
+			t.Errorf("after releasing everything the total is %v, want all zero", got)
+		}
+	})
+}
+
+func runAtespaceContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("ListAtespaces_Pagination", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		for i := 0; i < 5; i++ {
+			if _, err := s.CreateAtespace(ctx, newTestAtespace(fmt.Sprintf("team-%d", i))); err != nil {
+				t.Fatalf("failed to create atespace %d: %v", i, err)
+			}
+		}
+
+		var allAtespaces []*ateapi.Atespace
+		pageToken := ""
+		for {
+			page, err := s.ListAtespaces(ctx, store.ListOptions{PageSize: 2, PageToken: pageToken})
+			if err != nil {
+				t.Fatalf("ListAtespaces failed: %v", err)
+			}
+			allAtespaces = append(allAtespaces, page.Items...)
+			pageToken = page.NextPageToken
+			if pageToken == "" {
+				break
+			}
+		}
+
+		if len(allAtespaces) != 5 {
+			t.Fatalf("expected 5 atespaces total, got %d", len(allAtespaces))
+		}
+		seen := make(map[string]bool)
+		for _, a := range allAtespaces {
+			if seen[a.GetMetadata().GetName()] {
+				t.Errorf("duplicate atespace found in paginated results: %s", a.GetMetadata().GetName())
+			}
+			seen[a.GetMetadata().GetName()] = true
+		}
+	})
+
+	t.Run("CreateAtespace_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		want := newTestAtespace("team-a")
+		created, err := s.CreateAtespace(ctx, want)
+		if err != nil {
+			t.Fatalf("CreateAtespace failed: %v", err)
+		}
+		if created.GetMetadata().GetUid() == "" {
+			t.Errorf("CreateAtespace returned empty uid; want server-assigned uid")
+		}
+		if created.GetMetadata().GetVersion() != 1 {
+			t.Errorf("CreateAtespace returned version %d, want 1", created.GetMetadata().GetVersion())
+		}
+
+		got, err := s.GetAtespace(ctx, "team-a")
+		if err != nil {
+			t.Fatalf("GetAtespace failed: %v", err)
+		}
+		if diff := cmp.Diff(created, got, protocmp.Transform()); diff != "" {
+			t.Errorf("CreateAtespace return does not match stored state (-created +got):\n%s", diff)
+		}
+		if diff := cmp.Diff(want, created, protocmp.Transform(), ignoreUID, ignoreTimestamps, ignoreVersion); diff != "" {
+			t.Errorf("CreateAtespace returned unexpected atespace (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("CreateAtespace_AlreadyExists", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); err != nil {
+			t.Fatalf("first CreateAtespace failed: %v", err)
+		}
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("expected ErrAlreadyExists, got %v", err)
+		}
+	})
+
+	t.Run("GetAtespace_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.GetAtespace(ctx, "nope"); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("ListAtespaces", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		names := []string{"team-a", "team-b", "team-c"}
+		for _, n := range names {
+			if _, err := s.CreateAtespace(ctx, newTestAtespace(n)); err != nil {
+				t.Fatalf("CreateAtespace(%s) failed: %v", n, err)
+			}
+		}
+		gotResp, err := s.ListAtespaces(ctx, store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListAtespaces failed: %v", err)
+		}
+		got := gotResp.Items
+		if len(got) != len(names) {
+			t.Fatalf("ListAtespaces returned %d atespaces, want %d", len(got), len(names))
+		}
+		gotNames := map[string]bool{}
+		for _, a := range got {
+			gotNames[a.GetMetadata().GetName()] = true
+		}
+		for _, n := range names {
+			if !gotNames[n] {
+				t.Errorf("ListAtespaces missing %q; got %v", n, gotNames)
+			}
+		}
+	})
+
+	t.Run("ListAtespaces_Empty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		got, err := s.ListAtespaces(ctx, store.ListOptions{PageSize: 1000})
+		if err != nil {
+			t.Fatalf("ListAtespaces failed: %v", err)
+		}
+		if len(got.Items) != 0 {
+			t.Errorf("ListAtespaces on empty store = %v, want empty", got.Items)
+		}
+	})
+
+	t.Run("DeleteAtespace_Empty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); err != nil {
+			t.Fatalf("CreateAtespace failed: %v", err)
+		}
+		deleted, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteAtespace failed: %v", err)
+		}
+		if got := deleted.GetMetadata().GetName(); got != "team-a" {
+			t.Errorf("deleted atespace name = %q, want team-a", got)
+		}
+		if deleted.GetMetadata().GetDeleteTime() == nil {
+			t.Error("the deleted atespace carries no delete_time")
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("after delete, GetAtespace = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("DeleteAtespace_NotFound", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.DeleteAtespace(ctx, "nope", store.DeletePreconditions{}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
+	t.Run("DeleteAtespace_Preconditions", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		create := func() *ateapi.Atespace {
+			created, err := s.CreateAtespace(ctx, newTestAtespace("team-a"))
+			if err != nil {
+				t.Fatalf("CreateAtespace failed: %v", err)
+			}
+			return created
+		}
+		del := func(precondition store.DeletePreconditions) error {
+			_, err := s.DeleteAtespace(ctx, "team-a", precondition)
+			return err
+		}
+
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: 1}); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("guarded delete of a missing atespace = %v, want ErrNotFound", err)
+		}
+
+		atespace := create()
+		uid, version := atespace.GetMetadata().GetUid(), atespace.GetMetadata().GetVersion()
+		if err := del(store.DeletePreconditions{Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("stale version alone = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version + 1}); !errors.Is(err, store.ErrVersionConflict) {
+			t.Errorf("matching uid, stale version = %v, want ErrVersionConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid alone = %v, want ErrUIDConflict", err)
+		}
+		if err := del(store.DeletePreconditions{UID: foreignUID, Version: version}); !errors.Is(err, store.ErrUIDConflict) {
+			t.Errorf("foreign uid, matching version = %v, want ErrUIDConflict", err)
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); err != nil {
+			t.Fatalf("a refused delete removed the atespace: %v", err)
+		}
+
+		// Matching guards do not override the emptiness rule.
+		actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+		if _, err := s.CreateActor(ctx, newTestSuspendedActor(actorRef.Atespace, actorRef.Name)); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if err := del(store.DeletePreconditions{UID: uid, Version: version}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("matching guards on a non-empty atespace = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); err != nil {
+			t.Fatalf("a refused delete removed the atespace: %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActor failed: %v", err)
+		}
+
+		if err := del(store.DeletePreconditions{Version: version}); err != nil {
+			t.Fatalf("matching version alone = %v, want nil", err)
+		}
+		atespace = create()
+		if err := del(store.DeletePreconditions{UID: atespace.GetMetadata().GetUid()}); err != nil {
+			t.Fatalf("matching uid alone = %v, want nil", err)
+		}
+		atespace = create()
+		if err := del(store.DeletePreconditions{UID: atespace.GetMetadata().GetUid(), Version: atespace.GetMetadata().GetVersion()}); err != nil {
+			t.Fatalf("matching uid and version = %v, want nil", err)
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get after the delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("DeleteAtespace_NonEmpty_Rejected", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); err != nil {
+			t.Fatalf("CreateAtespace failed: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Name: "id1", Atespace: "team-a"}, Status: &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_DELETING}}); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("DeleteAtespace on non-empty = %v, want ErrFailedPrecondition", err)
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); err != nil {
+			t.Errorf("atespace should still exist after rejected delete, got %v", err)
+		}
+	})
+
+	t.Run("DeleteAtespace_EmptyAfterActorsRemoved", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); err != nil {
+			t.Fatalf("CreateAtespace failed: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Name: "id1", Atespace: "team-a"}, Status: &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_DELETING}}); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Fatalf("expected rejection while non-empty, got %v", err)
+		}
+		if _, err := s.DeleteActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"}, store.DeletePreconditions{}); err != nil {
+			t.Fatalf("DeleteActor failed: %v", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); err != nil {
+			t.Errorf("DeleteAtespace after actor removed = %v, want nil", err)
+		}
+	})
+
+	t.Run("DeleteAtespace_EmptyWhileOtherAtespaceNonEmpty", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-a")); err != nil {
+			t.Fatalf("CreateAtespace(team-a) failed: %v", err)
+		}
+		if _, err := s.CreateAtespace(ctx, newTestAtespace("team-b")); err != nil {
+			t.Fatalf("CreateAtespace(team-b) failed: %v", err)
+		}
+		if _, err := s.CreateActor(ctx, &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Name: "id1", Atespace: "team-b"}, Status: &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED}}); err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		if _, err := s.DeleteAtespace(ctx, "team-a", store.DeletePreconditions{}); err != nil {
+			t.Errorf("DeleteAtespace(team-a, empty) = %v, want nil (must not be blocked by team-b's actor)", err)
+		}
+		if _, err := s.GetAtespace(ctx, "team-a"); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("after delete, GetAtespace(team-a) = %v, want ErrNotFound", err)
+		}
+		if _, err := s.DeleteAtespace(ctx, "team-b", store.DeletePreconditions{}); !errors.Is(err, store.ErrFailedPrecondition) {
+			t.Errorf("DeleteAtespace(team-b, non-empty) = %v, want ErrFailedPrecondition", err)
+		}
+	})
+}
+
+func runLeaseContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("AcquireLease_Success", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		lease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("AcquireLease failed: %v", err)
+		}
+		if lease == nil {
+			t.Fatal("AcquireLease returned a nil lease")
+		}
+		if err := lease.Context().Err(); err != nil {
+			t.Errorf("new lease context is already done: %v", err)
+		}
+		lease.Close()
+	})
+
+	t.Run("AcquireLease_Conflict", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		lease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("first AcquireLease failed: %v", err)
+		}
+		defer lease.Close()
+
+		if _, err := s.AcquireLease(ctx, "test-lease"); !errors.Is(err, store.ErrLeaseConflict) {
+			t.Errorf("second AcquireLease error = %v, want ErrLeaseConflict", err)
+		}
+	})
+
+	t.Run("AcquireLease_NonReentry", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		lease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("first AcquireLease failed: %v", err)
+		}
+		defer lease.Close()
+
+		if _, err := s.AcquireLease(ctx, "test-lease"); !errors.Is(err, store.ErrLeaseConflict) {
+			t.Errorf("reentrant AcquireLease error = %v, want ErrLeaseConflict", err)
+		}
+	})
+
+	t.Run("Lease_Close_Releases", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		lease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("AcquireLease failed: %v", err)
+		}
+		lease.Close()
+
+		newLease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("AcquireLease after Close failed: %v", err)
+		}
+		newLease.Close()
+	})
+
+	t.Run("Lease_Close_Idempotent", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+
+		lease, err := s.AcquireLease(ctx, "test-lease")
+		if err != nil {
+			t.Fatalf("AcquireLease failed: %v", err)
+		}
+		lease.Close()
+		lease.Close()
+	})
+}
+
+// runUnknownFieldContractTests asserts that every read path, including the
+// object handed to a read-modify-write mutation, drops fields this binary has
+// no descriptor for at every nesting level.
+func runUnknownFieldContractTests(t *testing.T, setup func(t *testing.T) store.Interface) {
+	t.Helper()
+
+	t.Run("UnknownFields_Actor", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		created, err := s.CreateActor(ctx, withUnknownField(&ateapi.Actor{
+			Metadata:      withUnknownField(&ateapi.ResourceMetadata{Atespace: testAtespace, Name: "actor-1"}),
+			ActorTemplate: withUnknownField(&ateapi.ObjectRef{Atespace: testAtespace, Name: "tmpl-1"}),
+			Status:        withUnknownField(&ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_DELETING}),
+		}))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		ref := resources.ActorRefFromActor(created)
+
+		got, err := s.GetActor(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActor failed: %v", err)
+		}
+		assertPruned(t, "GetActor", created, got)
+
+		list, err := s.ListActors(ctx, testAtespace, store.ListOptions{})
+		if err != nil || len(list.Items) != 1 {
+			t.Fatalf("ListActors = %d items, %v; want 1", len(list.Items), err)
+		}
+		assertPruned(t, "ListActors", created, list.Items[0])
+
+		updated, err := s.UpdateActor(ctx, ref, store.PreconditionFrom(got), func(toUpdate *ateapi.Actor) error {
+			requireNoUnknownFields(t, "UpdateActor mutation input", toUpdate)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateActor failed: %v", err)
+		}
+		assertPruned(t, "UpdateActor", created, updated)
+
+		deleted, err := s.DeleteActor(ctx, ref, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteActor failed: %v", err)
+		}
+		assertPruned(t, "DeleteActor", created, deleted)
+	})
+
+	t.Run("UnknownFields_EgressPolicy", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(ctx, &ateapi.Actor{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "actor-1"},
+			Status:   &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
+		})
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+		ref := resources.ActorRefFromActor(actor)
+		created, err := s.CreateEgressPolicy(ctx, ref, withUnknownField(&ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "default"},
+			Rules: []*ateapi.EgressRule{withUnknownField(&ateapi.EgressRule{
+				Http: &ateapi.HttpRule{Hostnames: []string{"api.example.com"}, Ports: &ateapi.Ports{Numbers: []int32{80}}},
+			})},
+		}))
+		if err != nil {
+			t.Fatalf("CreateEgressPolicy failed: %v", err)
+		}
+
+		got, err := s.GetEgressPolicy(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetEgressPolicy failed: %v", err)
+		}
+		assertPruned(t, "GetEgressPolicy", created, got)
+
+		updated, err := s.UpdateEgressPolicy(ctx, ref, store.PreconditionFrom(got), func(toUpdate *ateapi.EgressPolicy) error {
+			requireNoUnknownFields(t, "UpdateEgressPolicy mutation input", toUpdate)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateEgressPolicy failed: %v", err)
+		}
+		assertPruned(t, "UpdateEgressPolicy", created, updated)
+
+		deleted, err := s.DeleteEgressPolicy(ctx, ref, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteEgressPolicy failed: %v", err)
+		}
+		assertPruned(t, "DeleteEgressPolicy", created, deleted)
+	})
+
+	t.Run("UnknownFields_Tag", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		actor, err := s.CreateActor(ctx, newTestSuspendedActor(testAtespace, "actor-1"))
+		if err != nil {
+			t.Fatalf("CreateActor failed: %v", err)
+		}
+
+		tagRef := resources.TagRef{Atespace: testAtespace, Name: "production"}
+		tag := withUnknownField(newTestInProgressTag(tagRef.Name, actor))
+		withUnknownField(tag.Metadata)
+		withUnknownField(tag.Status)
+		created, err := s.CreateTag(ctx, tag)
+		if err != nil {
+			t.Fatalf("CreateTag failed: %v", err)
+		}
+
+		got, err := s.GetTag(ctx, tagRef)
+		if err != nil {
+			t.Fatalf("GetTag failed: %v", err)
+		}
+		assertPruned(t, "GetTag", created, got)
+
+		list, err := s.ListTags(ctx, testAtespace, store.ListOptions{})
+		if err != nil || len(list.Items) != 1 {
+			t.Fatalf("ListTags = %d items, %v; want 1", len(list.Items), err)
+		}
+		assertPruned(t, "ListTags", created, list.Items[0])
+
+		updated, err := s.UpdateTag(ctx, tagRef, store.PreconditionFrom(got), func(toUpdate *ateapi.Tag) error {
+			requireNoUnknownFields(t, "UpdateTag mutation input", toUpdate)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateTag failed: %v", err)
+		}
+		assertPruned(t, "UpdateTag", created, updated)
+
+		deleted, err := s.DeleteTag(ctx, tagRef, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteTag failed: %v", err)
+		}
+		assertPruned(t, "DeleteTag", created, deleted)
+	})
+
+	t.Run("UnknownFields_Atespace", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		created, err := s.CreateAtespace(ctx, withUnknownField(&ateapi.Atespace{
+			Metadata: withUnknownField(&ateapi.ResourceMetadata{Name: testAtespace}),
+		}))
+		if err != nil {
+			t.Fatalf("CreateAtespace failed: %v", err)
+		}
+
+		got, err := s.GetAtespace(ctx, testAtespace)
+		if err != nil {
+			t.Fatalf("GetAtespace failed: %v", err)
+		}
+		assertPruned(t, "GetAtespace", created, got)
+
+		list, err := s.ListAtespaces(ctx, store.ListOptions{})
+		if err != nil || len(list.Items) != 1 {
+			t.Fatalf("ListAtespaces = %d items, %v; want 1", len(list.Items), err)
+		}
+		assertPruned(t, "ListAtespaces", created, list.Items[0])
+
+		deleted, err := s.DeleteAtespace(ctx, testAtespace, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteAtespace failed: %v", err)
+		}
+		assertPruned(t, "DeleteAtespace", created, deleted)
+	})
+
+	t.Run("UnknownFields_ActorTemplate", func(t *testing.T) {
+		s := setup(t)
+		ctx := context.Background()
+		mustCreateAtespace(t, s, testAtespace)
+		template := withUnknownField(newTestActorTemplate(testAtespace, "tmpl-1"))
+		withUnknownField(template.Metadata)
+		withUnknownField(template.Containers[0])
+		created, err := s.CreateActorTemplate(ctx, template)
+		if err != nil {
+			t.Fatalf("CreateActorTemplate failed: %v", err)
+		}
+		ref := resources.ActorTemplateRef{Atespace: testAtespace, Name: "tmpl-1"}
+
+		got, err := s.GetActorTemplate(ctx, ref)
+		if err != nil {
+			t.Fatalf("GetActorTemplate failed: %v", err)
+		}
+		assertPruned(t, "GetActorTemplate", created, got)
+
+		list, err := s.ListActorTemplates(ctx, testAtespace, store.ListOptions{})
+		if err != nil || len(list.Items) != 1 {
+			t.Fatalf("ListActorTemplates = %d items, %v; want 1", len(list.Items), err)
+		}
+		assertPruned(t, "ListActorTemplates", created, list.Items[0])
+
+		updated, err := s.UpdateActorTemplate(ctx, ref, store.PreconditionFrom(got), func(toUpdate *ateapi.ActorTemplate) error {
+			requireNoUnknownFields(t, "UpdateActorTemplate mutation input", toUpdate)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateActorTemplate failed: %v", err)
+		}
+		assertPruned(t, "UpdateActorTemplate", created, updated)
+
+		deleted, err := s.DeleteActorTemplate(ctx, ref, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteActorTemplate failed: %v", err)
+		}
+		assertPruned(t, "DeleteActorTemplate", created, deleted)
+	})
+
+	t.Run("UnknownFields_Worker", func(t *testing.T) {
+		s := setup(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		watch, err := s.WatchWorkers(ctx)
+		if err != nil {
+			t.Fatalf("WatchWorkers failed: %v", err)
+		}
+		defer watch.Close()
+
+		worker := withUnknownField(newTestWorker(testWorkerName, "pod-1"))
+		withUnknownField(worker.Metadata)
+		withUnknownField(worker.Status.Capacity)
+		created, err := s.CreateWorker(ctx, worker)
+		if err != nil {
+			t.Fatalf("CreateWorker failed: %v", err)
+		}
+		event := receiveEvent(t, watch.Events)
+		if event.Type != store.WorkerEventCreated {
+			t.Fatalf("event type = %v, want WorkerEventCreated", event.Type)
+		}
+		assertPruned(t, "WatchWorkers created event", created, event.Worker)
+
+		got, err := s.GetWorker(ctx, testWorkerName)
+		if err != nil {
+			t.Fatalf("GetWorker failed: %v", err)
+		}
+		assertPruned(t, "GetWorker", created, got)
+
+		list, err := s.ListWorkers(ctx, store.ListOptions{})
+		if err != nil || len(list.Items) != 1 {
+			t.Fatalf("ListWorkers = %d items, %v; want 1", len(list.Items), err)
+		}
+		assertPruned(t, "ListWorkers", created, list.Items[0])
+
+		updated, err := s.UpdateWorker(ctx, testWorkerName, store.PreconditionFrom(got), func(toUpdate *ateapi.Worker) error {
+			requireNoUnknownFields(t, "UpdateWorker mutation input", toUpdate)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("UpdateWorker failed: %v", err)
+		}
+		assertPruned(t, "UpdateWorker", created, updated)
+
+		deleted, err := s.DeleteWorker(ctx, testWorkerName, store.DeletePreconditions{})
+		if err != nil {
+			t.Fatalf("DeleteWorker failed: %v", err)
+		}
+		assertPruned(t, "DeleteWorker", created, deleted)
+	})
+}
+
+// sameAllocation compares two allocation totals by what they hold, so an
+// absent total and a zeroed one are the same.
+func sameAllocation(a, b *ateapi.WorkerResources) bool {
+	return a.GetActors() == b.GetActors() && a.GetCpuMillicores() == b.GetCpuMillicores() && a.GetMemoryBytes() == b.GetMemoryBytes()
+}

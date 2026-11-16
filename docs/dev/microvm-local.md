@@ -1,0 +1,210 @@
+# Running the microVM runtime locally
+
+The microVM sandbox class (`ateworker-microvm`: a Kata guest on Cloud Hypervisor)
+needs `/dev/kvm`, which takes some extra setup compared to the default gVisor
+path. This guide covers just that delta: getting a KVM-capable Docker
+environment — on Linux, or on Apple Silicon macOS via
+[Lima](https://lima-vm.io/) — then running the microVM counter demo and
+verifying a guest-memory snapshot round-trip.
+
+## Prerequisites
+
+Complete the
+[Quickstart (Development)](../../README.md#quickstart-development) in the
+README first — it covers the base tooling and the default (gVisor) path this
+guide builds on. For background on the runtime, see
+[architecture.md](../concepts/architecture.md).
+
+The `microvm` runtime (`cmd/ateworker-microvm`) fetches its guest toolchain at
+runtime rather than baking Kata into the worker image. Each actor container's
+rootfs is an overlay of a read-only lower (the OCI image, served into the guest
+over virtio-fs by `virtiofsd`) and a writable upper on a guest tmpfs, so the
+asset set is four files per architecture (`amd64` and `arm64`):
+
+- `cloud-hypervisor` — the VMM binary (from its release)
+- `virtiofsd` — the virtio-fs daemon serving the read-only lower (from `kata-static`)
+- `vmlinux` — the guest kernel (from `kata-static`)
+- `rootfs.img` — the guest rootfs image (from `kata-static`)
+
+`go run ./cmd/ate-setup deploy ate-system` (and `deploy sandboxconfig`)
+assembles the guest assets into `bin/microvm-assets/<arch>/` (the host
+architecture on kind, and both `amd64` and `arm64` on non-kind), verifies
+their SHA-256 digests against `manifests/ate-install/sandboxconfig-microvm.yaml.tmpl`,
+stages them into the cluster's object store under `microvm-assets/<arch>/<sha256>`
+(the shared `rustfs` bucket on kind, and `<BUCKET_NAME>-assets` on GKE, the only
+bucket substrate-gke's `setup-gcp` lets nodes read), and applies the cluster-wide `microvm`
+`SandboxConfig`. Assets must not be stored under a snapshot location (an
+ActorTemplate's `snapshotConfig.location` followed by `/atespaces/`), as the
+node's object-store plugin refuses to serve anything there as an asset.
+
+## Option A: Linux host with KVM
+
+Works on bare-metal Linux or any cloud VM with nested virtualization enabled
+(e.g. GCE N4/N4D instances with nested virt, or equivalent on other clouds).
+
+### 1. Verify KVM
+
+```sh
+ls -la /dev/kvm
+# Expected: crw-rw---- 1 root kvm 10, 232 ... /dev/kvm
+
+grep -cE '(vmx|svm)' /proc/cpuinfo   # >0 means CPU virt support (x86)
+```
+
+`hack/create-kind-cluster.sh` probes for KVM by running a root container with
+`--device /dev/kvm`, which works out of the box with a standard (rootful)
+Docker install. With **rootless Docker** the container's root is remapped to
+your user, so the probe fails with `permission denied` — use rootful Docker
+instead, or open up the device with `sudo chmod 666 /dev/kvm`.
+
+### 2. Create the cluster
+
+```sh
+./hack/create-kind-cluster.sh
+# Look for: "/dev/kvm found: microVM (kata + cloud-hypervisor) support will be enabled."
+```
+
+Once the control plane is up, atelet advertises the device on each KVM-capable
+node, which is what places microVM workers:
+
+```sh
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.ate\.dev/kvm}{"\n"}{end}'
+```
+
+### 3. Run the microVM demo
+
+```sh
+go run ./cmd/ate-setup --kind deploy ate-system --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/ate-system/sa/atenet-client
+go run ./cmd/ate-setup --kind deploy demo counter-microvm
+```
+
+`deploy ate-system` assembles the guest runtime assets for the host
+architecture if not already present under `bin/microvm-assets/<arch>/`, stages
+them into the in-cluster rustfs bucket, and applies the cluster-wide `microvm`
+`SandboxConfig`. `deploy demo counter-microvm` then deploys the demo worker
+pool + template.
+
+### 4. Verify
+
+```sh
+kubectl get pods -n ate-demo-counter-microvm
+kubectl get workerpools -A
+kubectl ate get actor-templates -a ate-demo-counter-microvm
+```
+
+Expected:
+
+```
+NAMESPACE                  NAME                                 DESIRED  READY  AVAILABLE
+ate-demo-counter-microvm   workerpool.ate.dev/counter-microvm   1        1      1
+
+ATESPACE                   NAME              GOLDEN TAG                             ERROR   AGE
+ate-demo-counter-microvm   counter-microvm   b9f6bd93-3c5a-4b64-9d5e-2f8a1c7d0e42           1m
+```
+
+The template is ready once the GOLDEN TAG column is non-empty (the
+value is a UUID); ERROR means the golden build failed, and `-o yaml` shows
+the full error message. An empty GOLDEN TAG with no ERROR means the
+golden build — a full guest boot plus checkpoint — is still running.
+
+## Option B: Apple Silicon macOS via Lima
+
+Lima can run a Linux VM with **nested virtualization**, exposing `/dev/kvm` to
+Docker (and therefore to the kind node) inside the VM. This is a well-trodden
+path — much of Substrate's development happens on macOS via limactl.
+
+> [!IMPORTANT]
+> Apple's Virtualization framework
+> [supports nested virtualization only on M3 and later](https://developer.apple.com/documentation/virtualization/vzgenericplatformconfiguration/isnestedvirtualizationsupported)
+> — on earlier Apple Silicon (M1/M2), Lima fails with
+> `[hostagent] Starting VZ ... FATA exiting`. Fall back to Option A on a
+> Linux host.
+
+### 1. Install Lima and the Docker CLI
+
+```sh
+brew install lima docker
+```
+
+### 2. Launch Lima with nested virtualization
+
+Start the `docker-rootful` template with nested virtualization and a writable home mount:
+
+```sh
+limactl start --name=docker-nested template:docker-rootful --cpus=8 --memory=16 --nested-virt --mount-writable
+```
+
+If prompted to edit the configuration, verify it includes at least:
+
+```yaml
+cpus: 8
+memory: "16GiB"
+nestedVirtualization: true
+networks:
+  - vzNAT: true
+mounts:
+  - location: "~"
+    writable: true
+```
+
+The writable home mount lets the kind/ko workflows write into your checkout,
+8 CPUs / 16 GiB is a comfortable floor for the control plane plus a microVM
+worker, and `vzNAT` gives the VM outbound networking under the vz VM type.
+
+On `arm64` (`amd64` is unaffected), Linux 6.19 and newer clear the active state
+of GICv3 LPIs when folding list registers on a VM exit (upstream commit
+`73c9726975af`). Under nested virtualization, hardware EOI in the L2 microVM
+guest then leaves the interrupt priority active in `ICH_AP1R0_EL2` and blocks
+subsequent `virtio` interrupts. Enable `kvm-arm.vgic_v3_group1_trap=1` on the
+Lima guest kernel so L1 KVM traps Group 1 EOI writes and clears the active
+priority in software:
+
+```sh
+limactl shell docker-nested sudo tee /etc/default/grub.d/99-vgic-trap.cfg <<'EOF'
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:-} kvm-arm.vgic_v3_group1_trap=1"
+EOF
+limactl shell docker-nested sudo update-grub
+limactl stop docker-nested
+limactl start docker-nested
+```
+
+### 3. Point the Docker CLI at Lima and bring everything up (on macOS)
+
+```sh
+export DOCKER_HOST="unix://${HOME}/.lima/docker-nested/sock/docker.sock"
+echo 'export DOCKER_HOST="unix://${HOME}/.lima/docker-nested/sock/docker.sock"' >> ~/.zprofile
+
+cd <your substrate checkout>
+
+./hack/create-kind-cluster.sh
+go run ./cmd/ate-setup --kind deploy ate-system --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/ate-system/sa/atenet-client
+go run ./cmd/ate-setup --kind deploy demo counter-microvm
+```
+
+The first run of `deploy ate-system` downloads the guest runtime
+releases and extracts them into `bin/microvm-assets/<arch>/`; later
+runs reuse that directory when the version stamp and SHA-256 digests match.
+
+Verify as in Option A, step 4.
+
+## Trying it out
+
+Next, create an actor from the `counter-microvm` template, hit the in-RAM
+counter, then suspend and resume it and confirm the count continues — proving
+the guest-memory snapshot round-tripped. The flow is the same as the
+[README Quickstart](../../README.md#quickstart-development), just with the
+microVM template; see the
+[counter demo's microVM steps](../../demos/counter/README.md#1-build-and-deploy)
+for background. Note that an actor template showing a GOLDEN SNAPSHOT in the
+verify step already exercises the runtime end-to-end — the golden snapshot
+requires a full guest boot and checkpoint.
+
+## Troubleshooting
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `/dev/kvm: permission denied` during the kind KVM probe | Rootless Docker: the probe container's root is remapped to your user, which can't open the device (`660 root:kvm`) | Use rootful Docker, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` |
+| Lima: `[hostagent] Starting VZ ... FATA exiting` on M1/M2 | Apple's Virtualization framework supports nested virtualization only on M3 and later | Use an M3+ Mac, or a Linux/KVM host (Option A) |
+| MicroVM golden build or actor boot hangs on arm64 Linux 6.19+ | L1 KVM drops LPI active state on VM exits, stalling `virtio` interrupts in nested guests | Add `kvm-arm.vgic_v3_group1_trap=1` to the Lima VM kernel command line and reboot (Option B, step 2) |

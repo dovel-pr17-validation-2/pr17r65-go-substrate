@@ -1,0 +1,519 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package egress implements the ext_proc handler for outbound actor traffic.
+// It authenticates the actor behind an egress CONNECT and authorizes what goes
+// through the tunnel against the actor's EgressPolicy. The dataplane decides
+// TLS at the ClientHello using the SNI rules returned on CONNECT.
+//
+// Identity comes from the actor certificate presented in the mTLS handshake,
+// never from a request header. On the inner legs it arrives as filter state
+// Envoy derived from that certificate, which nothing inside the tunnel can
+// write. The filter chain name tells the handler which leg it is on.
+package egress
+
+import (
+	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/api/credprovider/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/egress/actorjwt"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+const (
+	// agentgatewayClientCertificateAttribute is the PEM peer certificate agentgateway
+	// computes from the downstream TLS connection for ext_proc.
+	agentgatewayClientCertificateAttribute = "source.certificate"
+	// forwardedClientCertHeader is the header Envoy fills in with details of
+	// the mTLS peer, including the PEM chain it validated. The egress filter
+	// chain sets forward_client_cert_details: SANITIZE_SET, so whatever a
+	// client sends under this name is discarded and replaced by Envoy's own
+	// value.
+	//
+	// This is the only channel that can carry a whole certificate to ext_proc
+	// so the gateway can verify the chain, key usages, and worker SPIFFE URI.
+	//
+	// TODO(identity): Audit that this cannot be stomped by a header sent by the
+	// actor.
+	forwardedClientCertHeader = "x-forwarded-client-cert"
+	// xfccChainKey is the x-forwarded-client-cert key holding the URL-encoded
+	// PEM of the full presented chain, leaf first.
+	xfccChainKey = "chain"
+)
+
+// deniedBody is the body of every policy denial. The reason goes to the log,
+// not to the actor.
+const deniedBody = "egress denied"
+
+// Handler authenticates the actor behind each egress CONNECT and authorizes
+// the traffic inside the tunnel against the actor's EgressPolicy.
+type Handler struct {
+	apiClient ateapi.ControlClient
+	// loadActorIdentityRoots yields the actor-identity CA bundle every actor
+	// certificate must chain to. An error fails the CONNECT closed.
+	loadActorIdentityRoots func() (*x509.CertPool, error)
+	// policies is the per-actor EgressPolicy cache every leg reads through.
+	policies *policyCache
+	// actorJWTs mints the actor JWTs that credential injections ask for.
+	actorJWTs *actorjwt.Minter
+	// providers is a map of provider name (from the URI) to the credential
+	// provider.
+	//
+	// A special case of a map consisting of a single entry with empty string
+	// ("") key will match all provider URIs.
+	providers map[string]credprovider.CredentialProviderClient
+}
+
+// New builds the egress handler. loadActorIdentityRoots yields the egress
+// listener's trusted_ca; see verifyActorCertificate for why it is checked
+// again here. It is called on every CONNECT, so a rotated bundle applies to
+// the next tunnel. A nil loadActorIdentityRoots fails every CONNECT with 503.
+// policyCacheTTL of 0 fetches the policy on every callout.
+//
+// providers resolve an allowed rule's credential_uri injections on the
+// TLS-terminated MITM leg; none leaves them off, so a request that needs one is
+// denied. Actor JWT injections need no provider. See Handler.providers for the
+// map definition.
+func New(apiClient ateapi.ControlClient, loadActorIdentityRoots func() (*x509.CertPool, error), policyCacheTTL time.Duration, providers map[string]credprovider.CredentialProviderClient) *Handler {
+	if loadActorIdentityRoots == nil {
+		loadActorIdentityRoots = func() (*x509.CertPool, error) {
+			return nil, errors.New("no actor-identity CA configured")
+		}
+	}
+	return &Handler{
+		apiClient:              apiClient,
+		loadActorIdentityRoots: loadActorIdentityRoots,
+		policies:               newPolicyCache(apiClient, policyCacheTTL),
+		actorJWTs:              actorjwt.New(apiClient),
+		providers:              providers,
+	}
+}
+
+func (h *Handler) Direction() extproc.Direction { return extproc.DirectionEgress }
+
+// HandleRequestHeaders dispatches on the filter chain the request arrived on.
+// An empty chain name is a non-Envoy dataplane, which calls out for the
+// CONNECT alone. Anything unrecognized is refused, not guessed.
+func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestMetadata) (extproc.Result, error) {
+	switch leg := md.Attribute(extproc.FilterChainNameAttribute); leg {
+	case extproc.EgressFilterChainName, "":
+		return h.handleConnect(ctx, md, leg)
+	case extproc.EgressTLSMITMFilterChainName, extproc.EgressCleartextFilterChainName:
+		return h.handleRequest(ctx, md, leg)
+	default:
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_NotFound,
+			"egress denied: this gateway does not serve filter chain %q", leg)
+	}
+}
+
+// handleConnect authenticates the actor behind an egress CONNECT from the
+// certificate atunnel presented. Nothing the actor can write contributes to
+// the identity.
+//
+// It returns the SNI rules for the dialed port, and the port itself for the
+// passthrough chain. Actors without policy rules are refused here.
+func (h *Handler) handleConnect(ctx context.Context, md *extproc.RequestMetadata, leg string) (extproc.Result, error) {
+	// Sanity check that we were called on the Egress listener filter chain with
+	// a CONNECT.
+	if !strings.EqualFold(md.Method, "CONNECT") {
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_MethodNotAllowed,
+			"egress denied: expected CONNECT, got %q", md.Method)
+	}
+
+	// Without roots the gateway cannot authenticate anyone. Fail closed, and
+	// as 503 rather than 403: this is our misconfiguration, not the actor's.
+	roots, err := h.loadActorIdentityRoots()
+	if err != nil {
+		return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err,
+			"egress unavailable: actor-identity CA failed to load")
+	}
+
+	actorRef, err := authenticateActorCertificate(md, roots)
+	if err != nil {
+		// The body stays generic on purpose: an actor that fails authentication
+		// has not proven it is anyone, so it gets no detail about why. The
+		// specific reason rides along as the wrapped cause, which only the
+		// server-side log below reads.
+		slog.WarnContext(ctx, "egress denied: actor certificate rejected", slog.Any("err", err))
+		return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err,
+			"egress denied: invalid actor certificate")
+	}
+
+	if err := h.validateActor(ctx, actorRef, md.Host); err != nil {
+		return extproc.Result{}, err
+	}
+
+	ref := resources.ActorRef{Atespace: actorRef.Atespace, Name: actorRef.Name}
+
+	// atunnel always sends the address the actor's kernel dialed, never a
+	// name. Refuse a name here, where there is still a response to do it with.
+	dest, err := egresspolicy.NormalizeAuthority(md.Host)
+	if err != nil || !dest.IP.IsValid() || dest.Port == 0 {
+		slog.WarnContext(ctx, "egress denied: CONNECT authority is not an IP:port", slog.Any("actor", ref), slog.String("leg", leg), slog.String("authority", md.Host), slog.Any("err", err))
+		return extproc.Result{}, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
+	}
+
+	// This also warms the cache for the requests inside the tunnel, and
+	// refuses an actor whose policy could allow nothing.
+	policy, err := h.lookupPolicy(ctx, leg, ref)
+	if err != nil {
+		return extproc.Result{}, err
+	}
+	rules := policy.SNIRules(dest.Port)
+	dynamicMetadata, err := connectMetadata(dest, rules)
+	if err != nil {
+		return extproc.Result{}, err
+	}
+	slog.InfoContext(ctx, "egress tunnel opened: requests inside it are decided one by one",
+		slog.Any("actor", ref), slog.String("leg", leg), slog.String("destination", md.Host), slog.Int("sniRules", len(rules)))
+	res := allow()
+	res.DynamicMetadata = dynamicMetadata
+	return res, nil
+}
+
+// connectMetadata encodes the SNI rules for EgressPolicyMetadataNamespace and
+// the dialed port for EgressMetadataNamespace. The port is always set: without
+// it the passthrough chain falls back to its configured port instead of closing.
+func connectMetadata(dest egresspolicy.Destination, rules []egresspolicy.SNIRule) (*structpb.Struct, error) {
+	values := make([]*structpb.Value, len(rules))
+	for i, rule := range rules {
+		values[i] = structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+			extproc.EgressSNIRulePatternKey: structpb.NewStringValue(rule.Pattern),
+			extproc.EgressSNIRuleModeKey:    structpb.NewStringValue(string(rule.Mode)),
+		}})
+	}
+	policyStruct := &structpb.Struct{Fields: map[string]*structpb.Value{
+		extproc.EgressSNIRulesKey: structpb.NewListValue(&structpb.ListValue{Values: values}),
+	}}
+	policyJSON, err := policyStruct.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("marshaling egress policy metadata: %w", err)
+	}
+	return &structpb.Struct{Fields: map[string]*structpb.Value{
+		extproc.EgressMetadataNamespace: structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+			extproc.EgressDialedPortKey: structpb.NewStringValue(strconv.Itoa(int(dest.Port))),
+		}}),
+		extproc.EgressPolicyMetadataNamespace: structpb.NewStructValue(&structpb.Struct{Fields: map[string]*structpb.Value{
+			extproc.EgressPolicyJSONKey: structpb.NewStringValue(string(policyJSON)),
+		}}),
+	}}, nil
+}
+
+// metadataAnswer is an answer in the egress metadata namespace.
+func metadataAnswer(fields map[string]string) *structpb.Struct {
+	values := make(map[string]*structpb.Value, len(fields))
+	for key, value := range fields {
+		values[key] = structpb.NewStringValue(value)
+	}
+	return &structpb.Struct{Fields: map[string]*structpb.Value{
+		extproc.EgressMetadataNamespace: structpb.NewStructValue(&structpb.Struct{Fields: values}),
+	}}
+}
+
+// allow is the response for a request the handler lets through unchanged.
+func allow() extproc.Result {
+	return extproc.Result{
+		Response: &extprocv3.HeadersResponse{
+			Response: &extprocv3.CommonResponse{},
+		},
+	}
+}
+
+// lookupPolicy is the check every leg starts with. Every error it returns is
+// already a client-facing denial.
+func (h *Handler) lookupPolicy(ctx context.Context, leg string, ref resources.ActorRef) (*egresspolicy.Policy, error) {
+	policy, err := h.policies.get(ctx, ref)
+	switch {
+	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+		// The caller gave up mid-fetch: not a decision.
+		slog.DebugContext(ctx, "egress policy lookup abandoned by the caller", slog.Any("actor", ref), slog.String("leg", leg))
+		return nil, extproc.WrapReqError(envoy_type.StatusCode_RequestTimeout, err, "egress request canceled")
+	case errors.Is(err, errNoPolicy):
+		slog.WarnContext(ctx, "egress denied: actor has no egress policy", slog.Any("actor", ref), slog.String("leg", leg))
+		return nil, extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err, deniedBody)
+	case err != nil:
+		// The control plane failed, not the actor: 503, and nothing is cached.
+		slog.ErrorContext(ctx, "egress policy lookup failed", slog.Any("actor", ref), slog.String("leg", leg), slog.Any("err", err))
+		return nil, extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err, "egress unavailable: policy lookup failed")
+	case policy.RuleCount() == 0:
+		// Can authorize nothing, so the same posture as having no policy.
+		slog.WarnContext(ctx, "egress denied: actor's egress policy has no rules", slog.Any("actor", ref), slog.String("leg", leg))
+		return nil, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
+	}
+	return policy, nil
+}
+
+// validateActor checks the actor certified by the certificate against the control
+// plane's current view of that actor: it still exists and it is placed on a
+// worker. A refusal is logged with destination. Every error it returns is
+// already a client-facing ext_proc denial.
+func (h *Handler) validateActor(ctx context.Context, actorRef resources.ActorRef, destination string) error {
+	// Confirm the certified actor still exists.
+	// TODO: this can cause heavy load on ate api server. Change it based on https://github.com/agent-substrate/substrate/issues/592.
+	actor, err := h.apiClient.GetActor(ctx, &ateapi.GetActorRequest{
+		Actor: &ateapi.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
+	})
+	if err != nil {
+		return mapEgressIdentityError(actorRef.Atespace, actorRef.Name, err)
+	}
+
+	// The actor performing egress must be placed on a worker. RESUMING is
+	// saved together with the worker assignment, so a booting workload can
+	// reach the network before it answers its wakeup probe. Every other state
+	// has left its worker or is leaving it.
+	switch state := actor.GetStatus().GetState(); state {
+	case ateapi.ActorState_ACTOR_STATE_RUNNING, ateapi.ActorState_ACTOR_STATE_RESUMING:
+		return nil
+	default:
+		slog.WarnContext(ctx, "egress denied: actor is not placed on a worker",
+			slog.Any("actor", actorRef), slog.String("state", state.String()), slog.String("destination", destination))
+		return extproc.NewReqError(envoy_type.StatusCode_Forbidden,
+			"egress denied: actor %q/%q is %s, not placed on a worker", actorRef.Atespace, actorRef.Name, state)
+	}
+}
+
+// authenticateActorCertificate turns the mTLS peer certificate Envoy recorded
+// on the request into a verified ActorRef, or an error describing why it
+// cannot be trusted.
+func authenticateActorCertificate(md *extproc.RequestMetadata, roots *x509.CertPool) (resources.ActorRef, error) {
+	if certificate := md.Attribute(agentgatewayClientCertificateAttribute); certificate != "" {
+		chain, err := parseCertificateChainPEM([]byte(certificate))
+		if err != nil {
+			return resources.ActorRef{}, err
+		}
+		return verifyActorCertificate(chain, roots)
+	}
+	header := md.Header(forwardedClientCertHeader)
+	if header == "" {
+		return resources.ActorRef{}, fmt.Errorf("request carries no %s header", forwardedClientCertHeader)
+	}
+	chain, err := parseXFCCChain(header)
+	if err != nil {
+		return resources.ActorRef{}, err
+	}
+	return verifyActorCertificate(chain, roots)
+}
+
+// verifyActorCertificate checks that chain[0] is a live, non-CA, client-auth
+// worker actor certificate issued by the actor-identity CA, and returns the
+// ActorRef from its SPIFFE URI.
+//
+// The chain is verified here even though Envoy already did it at the handshake
+// (require_client_certificate with the actor-identity CA as trusted_ca). We have
+// to parse the certificate anyway to inspect its SPIFFE URI and usages, and
+// trusting a parsed-but-unverified certificate is a well-worn source of CVEs.
+// It also keeps the handler safe if the Envoy config is ever loosened, and costs
+// one signature check per CONNECT rather than per request. The IsCA, ClientAuth-EKU,
+// and worker SPIFFE URI checks below have no Envoy-side equivalent at all.
+func verifyActorCertificate(chain []*x509.Certificate, roots *x509.CertPool) (resources.ActorRef, error) {
+	leaf := chain[0]
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
+	}
+
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
+		return resources.ActorRef{}, fmt.Errorf("actor certificate is outside its validity period (%s..%s)",
+			leaf.NotBefore.Format(time.RFC3339), leaf.NotAfter.Format(time.RFC3339))
+	}
+	// An actor certificate is an end-entity credential. Refusing IsCA here stops
+	// a leaked or mis-issued CA certificate from being replayed as a leaf: chain
+	// verification alone would happily accept one.
+	if leaf.IsCA {
+		return resources.ActorRef{}, fmt.Errorf("actor certificate is a CA certificate")
+	}
+
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		CurrentTime:   now,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return resources.ActorRef{}, fmt.Errorf("actor certificate is not signed by the actor-identity CA: %w", err)
+	}
+
+	// Check that this is a worker certificate --- the SPIFFE URI should be of
+	// the form `spiffe://${trustdomain}/worker-for-actor/${atespace}/${actor}`.
+	if len(leaf.URIs) != 1 {
+		return resources.ActorRef{}, fmt.Errorf("actor certificate has %d URI SANs, want 1", len(leaf.URIs))
+	}
+	ref, err := resources.ActorRefFromWorkerForActorSPIFFEURL(leaf.URIs[0])
+	if err != nil {
+		return resources.ActorRef{}, fmt.Errorf("while parsing actor from SPIFFE ID: %w", err)
+	}
+	return ref, nil
+}
+
+// parseXFCCChain extracts the presented certificate chain, leaf first, from an
+// x-forwarded-client-cert header value.
+func parseXFCCChain(header string) ([]*x509.Certificate, error) {
+	// One element per proxy hop. SANITIZE_SET makes Envoy the only writer, so
+	// anything but exactly one element means either an unexpected proxy in front
+	// of the gateway or a listener that lost SANITIZE_SET — in both cases we no
+	// longer know which element describes our actual peer, so refuse to guess.
+	elements := splitXFCCUnquoted(header, ',')
+	if len(elements) != 1 {
+		return nil, fmt.Errorf("expected exactly one %s element, got %d", forwardedClientCertHeader, len(elements))
+	}
+	encoded, ok := xfccValue(elements[0], xfccChainKey)
+	if !ok {
+		return nil, fmt.Errorf("%s carries no %q value", forwardedClientCertHeader, xfccChainKey)
+	}
+	// Envoy percent-encodes the PEM. PathUnescape, not QueryUnescape: base64
+	// bodies contain '+', and query unescaping would decode it to a space and
+	// silently corrupt the DER.
+	chainPEM, err := url.PathUnescape(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decoding the client certificate chain: %w", err)
+	}
+
+	return parseCertificateChainPEM([]byte(chainPEM))
+}
+
+func parseCertificateChainPEM(chainPEM []byte) ([]*x509.Certificate, error) {
+	var chain []*x509.Certificate
+	rest := chainPEM
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parsing the client certificate chain: %w", err)
+		}
+		chain = append(chain, cert)
+	}
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("client certificate value carries no certificate")
+	}
+	return chain, nil
+}
+
+// xfccValue returns the value of key in one x-forwarded-client-cert element.
+// Keys are matched case-insensitively; Envoy emits "Chain", but the header is
+// consumed by enough different proxies that assuming its casing is not worth
+// the failure mode.
+func xfccValue(element, key string) (string, bool) {
+	for _, pair := range splitXFCCUnquoted(element, ';') {
+		k, v, found := strings.Cut(pair, "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(k), key) {
+			continue
+		}
+		return unquoteXFCC(strings.TrimSpace(v)), true
+	}
+	return "", false
+}
+
+// splitXFCCUnquoted splits on sep, ignoring separators inside a quoted value.
+// x-forwarded-client-cert quotes any value containing its own delimiters, which
+// the PEM ones always do.
+func splitXFCCUnquoted(s string, sep rune) []string {
+	var parts []string
+	var current strings.Builder
+	quoted := false
+	escaped := false
+	for _, r := range s {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case quoted && r == '\\':
+			current.WriteRune(r)
+			escaped = true
+		case r == '"':
+			quoted = !quoted
+			current.WriteRune(r)
+		case r == sep && !quoted:
+			parts = append(parts, current.String())
+			current.Reset()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	parts = append(parts, current.String())
+
+	trimmed := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			trimmed = append(trimmed, part)
+		}
+	}
+	return trimmed
+}
+
+// unquoteXFCC strips the surrounding quotes from an x-forwarded-client-cert
+// value and undoes the backslash escaping inside them.
+func unquoteXFCC(value string) string {
+	if len(value) < 2 || !strings.HasPrefix(value, `"`) || !strings.HasSuffix(value, `"`) {
+		return value
+	}
+	inner := value[1 : len(value)-1]
+	var out strings.Builder
+	escaped := false
+	for _, r := range inner {
+		if escaped {
+			out.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// mapEgressIdentityError converts a GetActor failure into a client-facing
+// ext_proc denial. An unknown actor is treated as forbidden (the actor was
+// deleted out from under a still-valid certificate); transient control-plane
+// failures fail closed with 503.
+func mapEgressIdentityError(atespace, actorName string, err error) error {
+	switch status.Code(err) {
+	case codes.NotFound:
+		return extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err,
+			"egress denied: unknown actor %q/%q", atespace, actorName)
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err,
+			"egress identity check unavailable for %q/%q: %v", atespace, actorName, err)
+	default:
+		return extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err,
+			"egress denied for %q/%q: %v", atespace, actorName, err)
+	}
+}

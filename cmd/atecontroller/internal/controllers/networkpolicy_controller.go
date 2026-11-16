@@ -1,0 +1,183 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controllers
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	k8errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+	networkingv1ac "k8s.io/client-go/applyconfigurations/networking/v1"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+const (
+	networkPolicyFieldOwner = "ate-networkpolicy"
+	atenetRouterAppName     = "atenet-router"
+	// eventReasonNetworkPolicyConflict is the reason of the Warning event a
+	// pool emits when checkNetworkPolicyOwner refuses its NetworkPolicy.
+	eventReasonNetworkPolicyConflict = "NetworkPolicyConflict"
+	// eventActionApplyNetworkPolicy is the action of that event.
+	eventActionApplyNetworkPolicy = "ApplyNetworkPolicy"
+)
+
+type NetworkPolicyReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+
+	// SystemNamespace is the namespace atenet-router runs in. The generated
+	// ingress policy admits only that namespace, so a value that does not
+	// match the running router blocks every request to the worker pool.
+	SystemNamespace string
+
+	// Recorder emits a Warning event on the pool when checkNetworkPolicyOwner
+	// refuses its NetworkPolicy, which leaves the pool without one.
+	Recorder events.EventRecorder
+}
+
+//+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+
+func (r *NetworkPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	wp := &atev1.WorkerPool{}
+	if err := r.Get(ctx, req.NamespacedName, wp); err != nil {
+		if k8errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get worker pool %q: %w", req.NamespacedName, err)
+	}
+
+	if !wp.GetDeletionTimestamp().IsZero() {
+		log.Info("WorkerPool is being deleted, NetworkPolicy will be GC'd via OwnerReference",
+			"namespace", wp.Namespace,
+			"name", wp.Name)
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.reconcileImpl(ctx, wp); err != nil {
+		log.Error(err, "Failed to reconcile NetworkPolicy")
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *NetworkPolicyReconciler) reconcileImpl(ctx context.Context, wp *atev1.WorkerPool) error {
+	log := log.FromContext(ctx)
+
+	npAC := r.buildNetworkPolicyApplyConfig(wp)
+
+	existing := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: *npAC.Namespace, Name: *npAC.Name}, existing)
+	switch {
+	case k8errors.IsNotFound(err):
+	case err != nil:
+		return fmt.Errorf("failed to get NetworkPolicy %s:%s: %w", *npAC.Namespace, *npAC.Name, err)
+	default:
+		if err := checkNetworkPolicyOwner(existing, wp); err != nil {
+			r.Recorder.Eventf(wp, existing, corev1.EventTypeWarning, eventReasonNetworkPolicyConflict, eventActionApplyNetworkPolicy, "%v", err)
+			return err
+		}
+	}
+
+	if err := r.Apply(ctx, npAC, client.FieldOwner(networkPolicyFieldOwner), client.ForceOwnership); err != nil {
+		return fmt.Errorf("failed to apply NetworkPolicy %s:%s: %w", *npAC.Namespace, *npAC.Name, err)
+	}
+	log.Info("reconcileImpl done",
+		"namespace", *npAC.Namespace,
+		"name", *npAC.Name)
+
+	return nil
+}
+
+// checkNetworkPolicyOwner returns an error if np belongs to something other
+// than wp. The apply forces ownership, so without this check it would rewrite
+// another pool's policy, or a policy someone else created with the same name.
+// A policy controlled by wp passes even if its label was edited, so the apply
+// restores it. A policy with no controller passes only if it is labeled for wp.
+func checkNetworkPolicyOwner(np *networkingv1.NetworkPolicy, wp *atev1.WorkerPool) error {
+	if owner := metav1.GetControllerOf(np); owner != nil {
+		if owner.UID == wp.UID {
+			return nil
+		}
+		return fmt.Errorf("refusing to take over NetworkPolicy %s:%s: controlled by %s %s (UID %s)",
+			np.Namespace, np.Name, owner.Kind, owner.Name, owner.UID)
+	}
+	if got := np.Labels[workerPoolLabel]; got != wp.Name {
+		return fmt.Errorf("refusing to take over NetworkPolicy %s:%s: label %s is %q, want %q",
+			np.Namespace, np.Name, workerPoolLabel, got, wp.Name)
+	}
+	return nil
+}
+
+func (r *NetworkPolicyReconciler) buildNetworkPolicyApplyConfig(wp *atev1.WorkerPool) *networkingv1ac.NetworkPolicyApplyConfiguration {
+	np := networkingv1ac.NetworkPolicy(resources.NetworkPolicyName(wp.Name), wp.Namespace).
+		WithLabels(map[string]string{
+			"ate.dev/worker-pool": wp.Name,
+		}).
+		WithOwnerReferences(metav1ac.OwnerReference().
+			WithAPIVersion(atev1.GroupVersion.String()).
+			WithKind("WorkerPool").
+			WithName(wp.Name).
+			WithUID(wp.UID).
+			WithController(true).
+			WithBlockOwnerDeletion(true))
+
+	// Ingress policy: only accept connections from the atenet-router, all ports.
+	np.
+		WithSpec(networkingv1ac.NetworkPolicySpec().
+			WithPodSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{"ate.dev/worker-pool": wp.Name})).
+			WithPolicyTypes(networkingv1.PolicyTypeIngress).
+			WithIngress(
+				networkingv1ac.NetworkPolicyIngressRule().
+					WithFrom(
+						networkingv1ac.NetworkPolicyPeer().
+							WithNamespaceSelector(metav1ac.LabelSelector().
+								WithMatchLabels(map[string]string{"kubernetes.io/metadata.name": r.SystemNamespace})).
+							WithPodSelector(metav1ac.LabelSelector().
+								WithMatchLabels(map[string]string{"app": atenetRouterAppName})),
+					),
+			))
+
+	// Egress is left unmanaged by Kubernetes NetworkPolicy for now while waiting for
+	// further progress on Egress API designs and because some egress rules may not be
+	// expressible at the Kubernetes layer.
+
+	return np
+}
+
+func (r *NetworkPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("networkpolicy").
+		For(&atev1.WorkerPool{}).
+		Owns(&networkingv1.NetworkPolicy{}).
+		Complete(r)
+}

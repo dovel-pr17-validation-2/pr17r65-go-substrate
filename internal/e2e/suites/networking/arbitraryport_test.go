@@ -1,0 +1,302 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package networking
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/resources"
+)
+
+// counterExtraPort is the counter demo's second listener (see
+// demos/counter/counter.yaml.tmpl's --extra-port flag), distinct from the
+// primary port 80 every other assertion in this suite addresses.
+const counterExtraPort = 9090
+
+// TestActorArbitraryPortAccess defines the acceptance contract for
+// atenet-router's arbitrary-port ingress support: a client reaches a port
+// other than an actor's primary one via HTTP CONNECT, with the target port
+// carried in the CONNECT authority (e.g. "<actor-dns>:9090") rather than a
+// separate header -- see ingress.Handler.HandleRequestHeaders and
+// TargetPortHeader in internal/atunnel/ingress.
+//
+// CONNECT establishment itself (RouterClient.Connect) succeeds as soon as
+// atenet-router's connect_terminate listener reinjects the tunnel into
+// main_internal -- an in-process handoff that never touches the actor -- so
+// it does not by itself prove the target port was reached. Both "reachable"
+// and "unlisted" cases below send a real HTTP request through the
+// established tunnel and inspect *that* response, which is where actor
+// resolution and atunnel's dial to the actor's pod actually happen.
+func TestActorArbitraryPortAccess(t *testing.T) {
+	ctx := context.Background()
+	_, actorName, _ := createAndResumeSubstrateActor(t, ctx, "arbitraryport", e2e.SubstrateCounterFixture())
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	// A tunnel that ends in an error, such as a reset, ends the whole
+	// port-forward it went through, so each later subtest opens its own.
+	router := mustRouterClient(t, ctx)
+	defer router.Close()
+
+	t.Run("regression: default port still reachable", func(t *testing.T) {
+		// The new capability must not disturb the existing default-port path.
+		body := waitForRouteReady(t, "default-port access through ingress", func() (*http.Response, error) {
+			return router.Get(ctx, actorRef, "/readyz")
+		})
+		t.Logf("default-port access through ingress succeeded; body: %s", body)
+	})
+
+	t.Run("arbitrary port reachable", func(t *testing.T) {
+		body := waitForTunneledRouteReady(t, ctx, router, actorRef, counterExtraPort)
+		if !strings.Contains(body, "extra port 9090") {
+			t.Fatalf("tunneled response body = %q, want it to mention extra port 9090", body)
+		}
+		t.Logf("arbitrary-port access through CONNECT succeeded; body: %s", body)
+	})
+
+	t.Run("tunnels to different ports do not cross", func(t *testing.T) {
+		// Two streams on one connection are handled by the same Envoy worker,
+		// and the held tunnel keeps its upstream connection open while the
+		// second tunnel opens.
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		router := mustRouterClient(t, ctx)
+		defer router.Close()
+		cc := dialConnectH2(t, ctx, router)
+		defer cc.Close()
+
+		held := connectH2(t, ctx, cc, actorRef, 80)
+		defer held.Close()
+		if body := getThroughTunnel(t, held, actorRef.Name); !strings.Contains(body, "preserved memory count:") {
+			t.Fatalf("tunnel to port 80 got %q, want the default port's response", body)
+		}
+
+		extra := connectH2(t, ctx, cc, actorRef, counterExtraPort)
+		defer extra.Close()
+		if body := getThroughTunnel(t, extra, actorRef.Name); !strings.Contains(body, "extra port 9090") {
+			t.Fatalf("tunnel to port %d got %q, want the extra port's response", counterExtraPort, body)
+		}
+	})
+
+	t.Run("unlisted port rejected", func(t *testing.T) {
+		// Nothing on the actor listens here. The tunnel itself still
+		// establishes (see the doc comment above), so the failure has to
+		// surface on the request sent through it -- atunnel's reverse proxy
+		// fails to dial the actor and reports it as an HTTP error, rather
+		// than the connection hanging or a request through it succeeding.
+		const unlistedPort = 6553
+		router := mustRouterClient(t, ctx)
+		defer router.Close()
+		conn, err := router.Connect(ctx, actorRef, unlistedPort)
+		if err != nil {
+			t.Fatalf("CONNECT to an unlisted port unexpectedly failed to establish: %v", err)
+		}
+		defer conn.Close()
+
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\n%s: %s\r\nConnection: close\r\n\r\n",
+			actorRef.Name, atenet.TargetActorHeader, actorRef.String()); err != nil {
+			t.Fatalf("writing tunneled request: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			// A reset/EOF while atunnel fails to dial the unlisted port is an
+			// acceptable rejection too, not just a well-formed error response.
+			t.Logf("tunneled request to an unlisted port correctly failed to read a response: %v", err)
+			return
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("tunneled request to an unlisted port unexpectedly returned HTTP 200; body: %s", body)
+		}
+		t.Logf("tunneled request to an unlisted port correctly returned HTTP %d; body: %s", resp.StatusCode, body)
+	})
+
+	t.Run("duplicate actor header rejected on CONNECT", func(t *testing.T) {
+		headers := http.Header{
+			atenet.TargetActorHeader: []string{actorRef.String(), "untrusted/actor"},
+		}
+		router := mustRouterClient(t, ctx)
+		defer router.Close()
+		conn, err := router.ConnectWithHeaders(ctx, actorRef, counterExtraPort, headers)
+		if err != nil {
+			// A rejected CONNECT handshake is a valid rejection.
+			t.Logf("CONNECT with duplicate headers rejected: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		resp, body, err := requestTunneled(conn, actorRef.Name)
+		if err != nil {
+			t.Logf("tunneled request with duplicate CONNECT headers correctly failed: %v", err)
+			return
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("request through CONNECT with duplicate actor headers returned %d, want 404; body: %s", resp.StatusCode, body)
+		}
+	})
+}
+
+// waitForTunneledRouteReady retries an entire CONNECT exchange while the
+// resumed actor's route propagates through atenet-router. A CONNECT tunnel is
+// tied to one upstream connection, so each retry must establish a fresh tunnel
+// rather than reusing a response that Envoy has already closed.
+func waitForTunneledRouteReady(t *testing.T, ctx context.Context, router *e2e.RouterClient, actorRef resources.ActorRef, port int) string {
+	t.Helper()
+	const timeout = 30 * time.Second
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	var lastStatus int
+	var lastBody string
+
+	for {
+		conn, err := router.Connect(ctx, actorRef, port)
+		if err == nil {
+			resp, body, requestErr := requestTunneled(conn, actorRef.Name)
+			_ = conn.Close()
+			if requestErr == nil && resp.StatusCode == http.StatusOK {
+				return body
+			}
+			lastErr = requestErr
+			if resp != nil {
+				lastStatus = resp.StatusCode
+				lastBody = body
+			}
+		} else {
+			lastErr = err
+		}
+
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				t.Fatalf("tunneled request to port %d did not become ready within %s: %v", port, timeout, lastErr)
+			}
+			t.Fatalf("tunneled request to port %d returned HTTP %d after %s, want 200; body: %s", port, lastStatus, timeout, lastBody)
+		}
+		if lastErr != nil {
+			t.Logf("tunneled request to port %d failed: %v; retrying...", port, lastErr)
+		} else {
+			t.Logf("tunneled request to port %d returned HTTP %d; retrying...", port, lastStatus)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// dialConnectH2 opens one HTTP/2 connection to the router's CONNECT listener.
+// That listener offers no ALPN, so net/http gets the TLS connection as if it
+// were plaintext, to start HTTP/2 without negotiation; Envoy recognizes it
+// from the first bytes.
+func dialConnectH2(t *testing.T, ctx context.Context, router *e2e.RouterClient) *http.ClientConn {
+	t.Helper()
+	address, stop, err := router.ConnectPortForward(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	transport := &http.Transport{
+		Protocols:   protocols,
+		DialContext: (&tls.Dialer{Config: router.TLSConfig()}).DialContext,
+	}
+	cc, err := transport.NewClientConn(ctx, "http", address)
+	if err != nil {
+		t.Fatalf("opening an HTTP/2 connection to the router's CONNECT listener: %v", err)
+	}
+	return cc
+}
+
+// connectH2 opens a CONNECT tunnel to port on actorRef as a new stream on cc.
+// Writes go out in the request body and reads come from the response body.
+func connectH2(t *testing.T, ctx context.Context, cc *http.ClientConn, actorRef resources.ActorRef, port int) io.ReadWriteCloser {
+	t.Helper()
+	body, writer := io.Pipe()
+	destination := net.JoinHostPort(actorRef.Name, strconv.Itoa(port))
+	req := (&http.Request{
+		Method:        http.MethodConnect,
+		URL:           &url.URL{Host: destination},
+		Host:          destination,
+		Header:        http.Header{atenet.TargetActorHeader: []string{actorRef.String()}},
+		Body:          body,
+		ContentLength: -1,
+	}).WithContext(ctx)
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("CONNECT to port %d: %v", port, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("CONNECT to port %d returned HTTP %d", port, resp.StatusCode)
+	}
+	return struct {
+		io.Writer
+		io.ReadCloser
+	}{writer, resp.Body}
+}
+
+// getThroughTunnel sends GET / through tunnel and returns the body of a 200
+// response, leaving the tunnel open.
+func getThroughTunnel(t *testing.T, tunnel io.ReadWriter, host string) string {
+	t.Helper()
+	if _, err := fmt.Fprintf(tunnel, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", host); err != nil {
+		t.Fatalf("writing a request through the tunnel: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(tunnel), nil)
+	if err != nil {
+		t.Fatalf("reading the response through the tunnel: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("reading the response body through the tunnel: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("request through the tunnel returned HTTP %d: %s", resp.StatusCode, body)
+	}
+	return string(body)
+}
+
+func requestTunneled(conn interface {
+	io.ReadWriter
+	SetDeadline(time.Time) error
+}, host string) (*http.Response, string, error) {
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return nil, "", fmt.Errorf("setting tunneled request deadline: %w", err)
+	}
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")); err != nil {
+		return nil, "", fmt.Errorf("writing tunneled request: %w", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("reading tunneled response: %w", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return resp, "", fmt.Errorf("reading tunneled response body (HTTP %d): %w", resp.StatusCode, err)
+	}
+	return resp, string(body), nil
+}

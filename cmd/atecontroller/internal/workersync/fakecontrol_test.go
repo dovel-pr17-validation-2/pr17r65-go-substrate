@@ -1,0 +1,326 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package workersync
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
+	"sync"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+// fakeControl is an in-memory stand-in for the Worker half of the Control API.
+//
+// It reproduces the behavior the syncer is written against and nothing more:
+// server-assigned uid and version, the uid+version precondition every update
+// carries, the NOT_FOUND / ALREADY_EXISTS / ABORTED codes, Workers born
+// UNAVAILABLE, state RPCs that are idempotent down to leaving the version
+// alone, and paged ListWorkers.
+//
+// Request validation is not mirrored — that is the server's own contract, and
+// duplicating it here would only test the copy. A test that needs a rejection
+// injects one through setCreateHook.
+// The embedded ControlClient is left nil: it supplies the RPCs outside the
+// Worker surface so this satisfies the interface, and panics if the syncer ever
+// reaches for one of them.
+type fakeControl struct {
+	ateapi.ControlClient
+
+	mu      sync.Mutex
+	workers map[string]*ateapi.Worker
+	uidSeq  int
+
+	// createHook, when set, decides CreateWorker's outcome: a non-nil error is
+	// returned and nothing is registered.
+	createHook func(*ateapi.Worker) error
+	// listHook, when set, runs before each ListWorkers and can fail the call.
+	listHook func(*ateapi.ListWorkersRequest) error
+	// updateHook, when set, runs once before an UpdateWorker applies, so a test
+	// can land a concurrent write and make the precondition fail.
+	updateHook func(name string)
+	// listPageSize overrides the requested page size when positive, so a
+	// handful of workers can be made to span several pages.
+	listPageSize int
+}
+
+func newFakeControl() *fakeControl {
+	return &fakeControl{workers: map[string]*ateapi.Worker{}}
+}
+
+// get returns the registered worker by name, or nil if there is none.
+func (f *fakeControl) get(name string) *ateapi.Worker {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w, ok := f.workers[name]
+	if !ok {
+		return nil
+	}
+	return proto.Clone(w).(*ateapi.Worker)
+}
+
+// names returns the names of every registered worker, sorted.
+func (f *fakeControl) names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Sorted(maps.Keys(f.workers))
+}
+
+// put registers a worker as if it had been created through the API, assigning
+// it a uid and version, so a test can start from a worker that already exists.
+func (f *fakeControl) put(w *ateapi.Worker) *ateapi.Worker {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.putLocked(w)
+}
+
+func (f *fakeControl) putLocked(w *ateapi.Worker) *ateapi.Worker {
+	stored := proto.Clone(w).(*ateapi.Worker)
+	f.uidSeq++
+	stored.Metadata = &ateapi.ResourceMetadata{
+		Name:    w.GetMetadata().GetName(),
+		Uid:     fmt.Sprintf("worker-uid-%d", f.uidSeq),
+		Version: 1,
+	}
+	if stored.GetStatus() == nil {
+		stored.Status = &ateapi.WorkerStatus{State: ateapi.WorkerState_WORKER_STATE_ACTIVE}
+	}
+	f.storeLocked(stored)
+	return proto.Clone(stored).(*ateapi.Worker)
+}
+
+// storeLocked writes w.
+func (f *fakeControl) storeLocked(w *ateapi.Worker) {
+	f.workers[w.GetMetadata().GetName()] = w
+}
+
+func (f *fakeControl) setCreateHook(hook func(*ateapi.Worker) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createHook = hook
+}
+
+func (f *fakeControl) setListHook(hook func(*ateapi.ListWorkersRequest) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listHook = hook
+}
+
+// setUpdateHookOnce arms a hook that fires on the next UpdateWorker and then
+// disarms itself. Firing once is what makes a conflict test converge: the retry
+// has to be able to succeed.
+func (f *fakeControl) setUpdateHookOnce(hook func(name string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updateHook = hook
+}
+
+func (f *fakeControl) takeUpdateHook() func(string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hook := f.updateHook
+	f.updateHook = nil
+	return hook
+}
+
+func (f *fakeControl) GetWorker(_ context.Context, in *ateapi.GetWorkerRequest, _ ...grpc.CallOption) (*ateapi.Worker, error) {
+	name := in.GetWorker().GetName()
+	if w := f.get(name); w != nil {
+		return w, nil
+	}
+	return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+}
+
+func (f *fakeControl) CreateWorker(_ context.Context, in *ateapi.CreateWorkerRequest, _ ...grpc.CallOption) (*ateapi.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.createHook != nil {
+		if err := f.createHook(in.GetWorker()); err != nil {
+			return nil, err
+		}
+	}
+	name := in.GetWorker().GetMetadata().GetName()
+	if _, ok := f.workers[name]; ok {
+		return nil, status.Errorf(codes.AlreadyExists, "Worker %s already exists", name)
+	}
+	// status is output-only: every Worker is born UNAVAILABLE.
+	created := proto.Clone(in.GetWorker()).(*ateapi.Worker)
+	created.Status = &ateapi.WorkerStatus{State: ateapi.WorkerState_WORKER_STATE_UNAVAILABLE}
+	return f.putLocked(created), nil
+}
+
+func (f *fakeControl) UpdateWorker(_ context.Context, in *ateapi.UpdateWorkerRequest, _ ...grpc.CallOption) (*ateapi.Worker, error) {
+	md := in.GetWorker().GetMetadata()
+	// Outside the lock: the hook is how a test lands a concurrent write, and it
+	// does that by calling back in.
+	if hook := f.takeUpdateHook(); hook != nil {
+		hook(md.GetName())
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Both guards are required. An update that pins neither is a blind write,
+	// which the server rejects before it reaches the store.
+	if md.GetUid() == "" || md.GetVersion() == 0 {
+		return nil, status.Error(codes.InvalidArgument, "update must carry metadata.uid and metadata.version")
+	}
+	stored, ok := f.workers[md.GetName()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "Worker %s not found", md.GetName())
+	}
+	if md.GetUid() != stored.GetMetadata().GetUid() || md.GetVersion() != stored.GetMetadata().GetVersion() {
+		return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+	}
+
+	// UpdateWorker replaces the whole resource: the request's Worker is taken
+	// wholesale and only the server-owned metadata and status are kept as
+	// stored.
+	updated := proto.Clone(in.GetWorker()).(*ateapi.Worker)
+	updated.Metadata = proto.Clone(stored.GetMetadata()).(*ateapi.ResourceMetadata)
+	updated.Status = proto.Clone(stored.GetStatus()).(*ateapi.WorkerStatus)
+
+	// labels are the only field an update may change, so pinning them to what
+	// is stored leaves any remaining difference on a field that is immutable
+	// after create, including one the request cleared by omitting it.
+	probe := proto.Clone(updated).(*ateapi.Worker)
+	probe.Labels = stored.GetLabels()
+	if !proto.Equal(probe, stored) {
+		return nil, status.Error(codes.InvalidArgument, "update changed a field that is immutable after create")
+	}
+
+	updated.Metadata.Version++
+	f.storeLocked(updated)
+	return proto.Clone(updated).(*ateapi.Worker), nil
+}
+
+func (f *fakeControl) DeleteWorker(_ context.Context, in *ateapi.DeleteWorkerRequest, _ ...grpc.CallOption) (*ateapi.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	name := in.GetWorker().GetName()
+	stored, ok := f.workers[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+	}
+	delete(f.workers, name)
+	return stored, nil
+}
+
+func (f *fakeControl) DrainWorker(_ context.Context, in *ateapi.DrainWorkerRequest, _ ...grpc.CallOption) (*ateapi.DrainWorkerResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	name := in.GetWorker().GetName()
+	stored, ok := f.workers[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+	}
+	if stored.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_DRAINING {
+		// Already draining: no write, and specifically no version bump.
+		return &ateapi.DrainWorkerResponse{Worker: proto.Clone(stored).(*ateapi.Worker)}, nil
+	}
+	drained := proto.Clone(stored).(*ateapi.Worker)
+	drained.Status.State = ateapi.WorkerState_WORKER_STATE_DRAINING
+	drained.Metadata.Version++
+	f.storeLocked(drained)
+	return &ateapi.DrainWorkerResponse{Worker: proto.Clone(drained).(*ateapi.Worker)}, nil
+}
+
+func (f *fakeControl) MarkWorkerAvailable(_ context.Context, in *ateapi.MarkWorkerAvailableRequest, _ ...grpc.CallOption) (*ateapi.MarkWorkerAvailableResponse, error) {
+	w, err := f.markWorker(in.GetWorker().GetName(), ateapi.WorkerState_WORKER_STATE_ACTIVE)
+	if err != nil {
+		return nil, err
+	}
+	return &ateapi.MarkWorkerAvailableResponse{Worker: w}, nil
+}
+
+func (f *fakeControl) MarkWorkerUnavailable(_ context.Context, in *ateapi.MarkWorkerUnavailableRequest, _ ...grpc.CallOption) (*ateapi.MarkWorkerUnavailableResponse, error) {
+	w, err := f.markWorker(in.GetWorker().GetName(), ateapi.WorkerState_WORKER_STATE_UNAVAILABLE)
+	if err != nil {
+		return nil, err
+	}
+	return &ateapi.MarkWorkerUnavailableResponse{Worker: w}, nil
+}
+
+// markWorker moves a Worker between ACTIVE and UNAVAILABLE as the Mark RPCs
+// do: idempotent down to leaving the version alone, with DRAINING final.
+func (f *fakeControl) markWorker(name string, state ateapi.WorkerState) (*ateapi.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	stored, ok := f.workers[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "Worker %s not found", name)
+	}
+	switch stored.GetStatus().GetState() {
+	case state:
+		return proto.Clone(stored).(*ateapi.Worker), nil
+	case ateapi.WorkerState_WORKER_STATE_DRAINING:
+		return nil, status.Errorf(codes.FailedPrecondition, "Worker %s is draining", name)
+	}
+	marked := proto.Clone(stored).(*ateapi.Worker)
+	marked.Status.State = state
+	marked.Metadata.Version++
+	f.storeLocked(marked)
+	return proto.Clone(marked).(*ateapi.Worker), nil
+}
+
+func (f *fakeControl) ListWorkers(_ context.Context, in *ateapi.ListWorkersRequest, _ ...grpc.CallOption) (*ateapi.ListWorkersResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.listHook != nil {
+		if err := f.listHook(in); err != nil {
+			return nil, err
+		}
+	}
+
+	// The page token is a stateless cursor into the sorted name list, so
+	// retrying a failed page with the same token resumes from the same place.
+	names := slices.Sorted(maps.Keys(f.workers))
+	start := 0
+	if in.GetOptions().GetPageToken() != "" {
+		var err error
+		if start, err = strconv.Atoi(in.GetOptions().GetPageToken()); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "malformed page token %q", in.GetOptions().GetPageToken())
+		}
+	}
+	size := int(in.GetOptions().GetPageSize())
+	if f.listPageSize > 0 {
+		size = f.listPageSize
+	}
+	if size <= 0 {
+		size = len(names)
+	}
+	end := min(start+size, len(names))
+
+	resp := &ateapi.ListWorkersResponse{}
+	for _, name := range names[start:end] {
+		resp.Workers = append(resp.Workers, proto.Clone(f.workers[name]).(*ateapi.Worker))
+	}
+	if end < len(names) {
+		resp.NextPageToken = strconv.Itoa(end)
+	}
+	return resp, nil
+}

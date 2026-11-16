@@ -1,0 +1,58 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This demo exercises request parking in the atenet router. The WorkerPool is
+# deliberately small (2 workers) so that creating and requesting more than two
+# actors at once oversubscribes the pool. When AssignWorker finds no worker with
+# room it returns ResourceExhausted ("no worker has room for the actor"); with
+# parking enabled (the default) the router holds such requests and retries the
+# resume until a worker frees up (e.g. another actor suspends), instead of
+# failing fast with 503. The workload is the counter binary from the counter
+# demo.
+#
+# The ActorTemplate is not a CRD: it lives in parking-template.yaml.tmpl and
+# is created through the ate API with `kubectl ate create actor-template`.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-parking
+
+---
+
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: parking
+  namespace: ate-demo-parking
+  labels:
+    workload: parking
+spec:
+  # Intentionally small: 2 workers, so 3+ concurrently-active actors saturate
+  # the pool and exercise the parking path.
+  replicas: 2
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor
+  template:
+    # Each worker advertises its container limits as capacity. Sizing CPU to
+    # one actor's limit in parking-template.yaml.tmpl caps each worker at one
+    # running actor.
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi

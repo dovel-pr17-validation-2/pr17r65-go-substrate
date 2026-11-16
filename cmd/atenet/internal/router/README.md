@@ -1,0 +1,304 @@
+# router
+
+Router has several responsibilities:
+
+* Serves Envoy xDS configuration when `--atenet-dataplane=envoy` (the default).
+  With `--atenet-dataplane=agentgateway`, the sidecar uses a static ConfigMap and
+  atenet does not start an xDS server.
+* ext_proc server for the dataplane. To make the deployment and debugging easier, we will run this component together
+  with the router, but this will be split later into its own component.
+  * ext_proc will call into the ATE gRPC API to get the set of relevant backends (specific the worker IP) and
+    route the traffic accordingly
+  * Make sure the interface with ATE API is pluggable so that we can test with a mock ATE API.
+* Runs an xDS server for the Envoy deployment that defines the Cluster information for the ATEs.
+  * the xDS configuration will configure Envoy to send traffic to ext_proc
+* Parks requests whose actor cannot be served immediately due to transient
+  worker-pool saturation, retrying the resume until the actor is routable or a
+  bounded wait elapses, instead of failing fast. See
+  [docs/concepts/request-parking.md](../../../../docs/concepts/request-parking.md).
+* Drains gracefully on SIGTERM: flips `/readyz` so the Service stops sending
+  new connections, waits out endpoint propagation (`--drain-delay`), drains the
+  dataplane's established connections (Envoy only — driven over its admin API;
+  agentgateway manages its own termination), gracefully stops the ext_proc
+  server so parked requests finish normally (`--drain-timeout`, derived from
+  the parking budget), then writes a drain-complete marker that releases the
+  dataplane container's `preStop` hook. See `drain.go` and `envoydrain.go`.
+* Authenticates actor identity on egress: on every CONNECT, the egress
+  gateway's ext_proc handler re-verifies the actor's client certificate against
+  the actor-identity CA, reads the actor from its SPIFFE URI SAN, and checks
+  with the ATE API that the actor exists and is running.
+* Authorizes egress against the actor's `EgressPolicy`: every request the
+  gateway can read is decided on its `Host` and the port the actor dialed,
+  the most specific rule winning; TLS it does not terminate is decided by SNI
+  at the ClientHello. An actor with no policy gets no tunnel. See
+  [egress legs](#egress-legs).
+* Serves arbitrary-port ingress: a client reaches a port on the actor other
+  than its default (80) by sending an HTTP CONNECT to
+  `<actor-dns>:<port>` on `--port-connect-tls`, rather than
+  naming the port some other way. Envoy terminates the CONNECT and reinjects
+  the tunneled bytes into an internal listener that runs the same ext_proc
+  path as ordinary traffic, so each request inside a long-lived tunnel still
+  resumes the actor and re-routes independently if it moves workers. Only
+  HTTP(S) traffic over the tunnel is supported today -- see `xds.go`'s
+  `connect_terminate_tls`/`main_internal` listeners and
+  `ingress.Handler.HandleRequestHeaders`.
+
+## packages
+
+The ext_proc server handles both traffic directions, and they apply opposite
+trust models — egress derives the actor identity from a client certificate the
+gateway verified against the actor-identity CA, ingress treats every request
+header as unauthenticated client input — so the two are kept in separate
+packages that cannot reach into each other:
+
+* `extproc` — the mux, and nothing else. It terminates the ext_proc stream,
+  decides which direction a request arrived on, dispatches to the `Handler`
+  registered for that direction, and records latency and outcome. It also owns
+  the vocabulary both handlers share (`RequestMetadata`, `Result`, `ReqError`).
+  It imports neither handler package.
+* `ingress` — resume, park, and route to the actor's worker.
+* `egress` — certificate-based actor-identity authentication for outbound
+  CONNECTs, and `EgressPolicy` enforcement on the legs inside the tunnel.
+
+Direction is decided by the filter chain the dataplane says accepted the
+request (`xds.filter_chain_name`, an Envoy attribute the egress gateway is
+configured to send), never by anything in the request itself, so a client
+cannot pick the egress path by crafting one. `router` itself does the wiring.
+
+## egress legs
+
+The egress gateway calls the same ext_proc sidecar from three Envoy filter
+chains, and the chain
+name (`xds.filter_chain_name`) tells the handler which leg it is on:
+
+| Leg (filter chain) | Where | Sees | Decides |
+| --- | --- | --- | --- |
+| `egress` | outer CONNECT | actor certificate, the `IP:port` the actor dialed | per TCP connection: identity, and that the actor has a policy with rules |
+| `egress_cleartext` | HTTP the actor sent in the clear | `Host`, method, headers, the dialed `IP:port` | **every request**, the `http` rules |
+| `egress_tls_mitm` | TLS the gateway terminated | same as cleartext, plus the connection's SNI | **every request**, the `https` rules |
+
+A request leg decides the request on its `Host`, a DNS name or an IP literal,
+and the port the actor dialed: the `http` rules on the cleartext chain, the
+`https` rules on the MITM chain, the most specific match winning as the API
+describes. On the MITM chain the connection's SNI and port must fall under an
+`https` rule first, which is the half of that rule the API evaluates at the
+ClientHello. The answer (`dev.ate.egress:dial`) picks the route, and there is
+only one today: the name that was policed, answered as `dev.ate.egress:host`,
+is resolved and dialed through `dynamic_forward_proxy`, with TLS
+re-originated to it on the TLS leg. There is no route without an answer, and
+no by-name route without the name.
+
+The port a rule names, and the port the gateway dials, is the one the actor
+dialed, never a port in the request's `Host`. The outer chain shares the
+CONNECT authority with the inner listener as `dev.ate.connect.authority`, and
+the request legs match `ports` against it; a dataplane that does not share it
+gets no port enforcement.
+
+The CONNECT leg decides per connection: it refuses an actor without a policy
+with rules. For the rest it hashes the policy's SNI rules for the destination
+port, stores them in the thread-local store under that hash, and hands the
+inner listener the port the actor dialed, as `envoy.upstream.dynamic_port`,
+and the hash, as `dev.ate.policy.egress.hash`. At the ClientHello the
+egress-policy module reads the hash, fetches the rules from the thread-local
+store, and picks the chain: `egress_tls_mitm` under an `https`
+rule, `egress_passthrough` under a `tls_passthrough` rule, and `denied`, which
+matches no chain and closes the connection, when neither covers the SNI. The
+passthrough chain resolves the SNI and relays the bytes to it on the dialed
+port; the address the actor dialed plays no part (see
+`docs/guides/network-egress.md`).
+
+Identity on the request legs is `dev.ate.actor.identity`, the actor's SPIFFE
+ID that the outer chain set from the verified peer certificate and shares with
+the inner listener. Envoy builds every inner connection from the filter state
+of the tunnel that created its pool, so `mitm_internal` keys its pools on the
+identity, the CONNECT authority and the policy hash: tunnels share a pool only
+when all three match, and no tunnel inherits another's identity, authority or
+rules. Nothing inside the
+tunnel can write any of this; a callout without an identity is refused.
+
+Policies are read through a per-actor cache (`--egress-policy-cache-ttl`, 10s
+by default; 0 disables it). The TTL is exactly how stale a decision can be: a
+create, update or delete is visible to new requests within one TTL, and a
+deleted policy becomes a deny. Every policy denial answers a fixed
+`egress denied` body; the reason is in the sidecar's log.
+
+Credential injection (`replace_headers`) runs on both request legs: a header
+the request carries is replaced with the credential from the provider, and a
+request without it is forwarded unchanged. See
+`docs/guides/egress-credential-injection.md`.
+
+## adding a dataplane attribute
+
+The filter-state objects and request attributes a proxy carries alongside
+a request are declared once, in `extproc/attributes.go`. The exception is the
+keys only the router's generated Envoy config reads, which stay in `xds.go`.
+
+| key | direction | purpose |
+| --- | --- | --- |
+| `dev.ate.target.actor` | ingress | carries the actor routing target across CONNECT re-entry |
+| `dev.ate.connect.authority` | ingress, egress | carries the outer CONNECT authority across re-entry: target-port selection on ingress, the dialed port the request legs match `ports` against on egress |
+| `dev.ate.actor.identity` | egress | carries the authenticated actor identity to the policy ext_proc, the logs and additional ext_proc services |
+| `dev.ate.policy.egress` | egress | dynamic metadata: the CONNECT leg's SNI rules for the dialed port, which the egress-policy module stores by hash |
+| `dev.ate.policy.egress.hash` | egress | filter state: the hash the inner listener looks those SNI rules up by |
+| `dev.ate.egress:dialed_port` | egress | dynamic metadata: the CONNECT leg's answer, the port the passthrough chain dials the resolved SNI on |
+| `dev.ate.egress:dial` | egress | dynamic metadata: a request leg's answer, `name`, which picks the route |
+| `dev.ate.egress:host` | egress | dynamic metadata: the name the request was decided on, which the forward proxy dials on the port the actor dialed |
+| `dev.ate.egress.filter_chain` | egress | filter state: the egress-policy module's verdict, which selects the inner filter chain |
+| `dev.ate.extproc.direction` | egress | selects the egress handler for dataplanes without Envoy filter chains |
+| `dev.ate.tunnel.{key,worker,actor,port}` | ingress | filter state: the routing decision carried into `actor_connect` (declared in `xds.go`) |
+
+### name it
+
+A new key substrate owns is rooted at `dev.ate.`, then a dotted path naming the
+thing it carries: `dev.ate.<area>.<thing>`, or `dev.ate.<thing>` when there is
+no area to disambiguate. These keys live in a namespace owned by the proxy that
+carries them — Envoy filter state, agentgateway CEL — and shared with whatever
+else a deployment configures alongside substrate, so the reverse-DNS root is
+what keeps them from colliding.
+
+A key someone else owns keeps *their* reverse-DNS root; do not re-home it under
+`dev.ate.` to make the set look uniform. `xds.filter_chain_name` is Envoy's own
+attribute and stays in Envoy's namespace. A key defined by a vendor's extension
+or by an additional ext_proc service a deployment splices in belongs under that
+vendor's own root, on the same reasoning that gives substrate `dev.ate.`. The
+prefix is a claim about who may rename the key, so getting it wrong means
+substrate is renaming something it does not own, or holding a name it never
+reserved.
+
+### wire it up
+
+1. **Declare the constant** in `extproc/attributes.go`.
+2. **Set it in the dataplane.**
+3. **Ask for it.** ext_proc only receives the attributes named in its filter's
+   `request_attributes`. A key that is set but not requested arrives as nothing
+   at all, which reads the same as a key that was never set.
+4. **Read it** through `RequestMetadata.Attribute`.
+
+### keep it trustworthy
+
+An attribute is only as trustworthy as its source. The actor target carries
+the client-selected actor reference, while the CONNECT authority carries
+only the requested target port across tunnel re-entry. Security-sensitive
+attributes, such as actor identity, must come from dataplane-authenticated
+state rather than a client header.
+
+## modes
+
+One binary serves both directions, one per instance. `--mode` (required)
+selects which:
+
+| `--mode` | ext_proc handlers | xDS server | Kubernetes access |
+| --- | --- | --- | --- |
+| `ingress` | ingress | yes | yes |
+| `egress` | egress | no | none |
+
+The mux refuses a direction this instance was not started to serve (404) rather
+than falling back to the other handler, which would run the request through the
+wrong trust model.
+
+Ingress and egress are deployed separately — `atenet-router` fronts the
+ingress dataplane, `atenet-egress` the egress gateway.
+
+`--atenet-dataplane` selects the dataplane for both Deployments. Each gateway has
+its own static configuration because ingress and egress scale independently.
+
+## Ingress client authentication and authorization
+
+The Envoy ingress router serves only TLS listeners, and every client must
+present a SPIFFE certificate. The agentgateway dataplane does not authenticate
+clients yet.
+
+Configure the CA that is used to validate client certificates with the
+`--ingress-client-ca-file` flag, which points at a PEM file containing root
+certificates.
+
+Right now the only "authorization" policy is to check the client's SPIFFE ID
+against a static allowlist.  Any ID on the allowlist may use the ingress router
+to contact any actor.  Richer authorization policies may be added post-GA.  Use
+the `--ingress-allowed-spiffe-ids` flag to set the allowlist (comma-separated
+list). With an empty allowlist, the Envoy router serves no listener, so no
+traffic reaches actors through it.
+
+### Common setups
+
+The default install sets `--ingress-client-ca-file` to the trust bundle of
+substrate's pod identity signer, `podidentity.podcert.ate.dev/identity`. That
+signer issues certificates with the SPIFFE ID
+`spiffe://cluster.local/ns/<namespace>/sa/<serviceaccount>`.
+
+The router's serving certificate comes from the
+`servicedns.podcert.ate.dev/identity` signer. Clients verify it against that
+signer's ClusterTrustBundle, with server name
+`atenet-router.ate-system.svc`.
+
+**Custom CA.** An installer can point `--ingress-client-ca-file` at a CA of
+their own choosing. Clients then get certificates from that CA however the
+installer provides them, and the allowlist holds the SPIFFE IDs it issues.
+
+**Client in the cluster, pod identity CA.** Mount a client certificate with a
+`podCertificate` projected volume, and the router's serving CA with a
+`clusterTrustBundle` projected volume:
+
+```yaml
+volumes:
+- name: router-client
+  projected:
+    sources:
+    - podCertificate:
+        signerName: podidentity.podcert.ate.dev/identity
+        keyType: ECDSAP256
+        credentialBundlePath: credential-bundle.pem
+    - clusterTrustBundle:
+        signerName: servicedns.podcert.ate.dev/identity
+        labelSelector:
+          matchLabels:
+            podcert.ate.dev/canarying: live
+        path: router-ca.pem
+```
+
+Add the pod's SPIFFE ID to `--ingress-allowed-spiffe-ids`.
+
+**Client outside the cluster, pod identity CA.** `kubectl ate proxy actor`
+forwards local TCP ports to an actor through the router's CONNECT listener. It
+presents a certificate for
+`spiffe://cluster.local/ns/ate-system/sa/atenet-client`, so that ID must be in
+`--ingress-allowed-spiffe-ids`. It requests the certificate the way
+`internal/podidentity` does: a PodCertificateRequest for the podidentity
+signer that names a pod, node and ServiceAccount that don't exist.
+kube-apiserver checks those only for requests from a kubelet, and the signer
+issues the SPIFFE ID of the named namespace and ServiceAccount. The client
+keeps the private key, reads the chain from the request's status, and reads
+the servicedns ClusterTrustBundle to verify the router.
+
+Creating PodCertificateRequests needs RBAC for that resource in `ate-system`.
+That RBAC can request a certificate for any SPIFFE ID in `ate-system`,
+including those of atelet, ate-controller and ate-api-server, so grant it only
+to users you would trust with those components.
+
+## status page
+
+The unauthenticated `/statusz` dashboard binds to `127.0.0.1:4040` by default
+(`--status-address` and `--status-port`). It is not published by the router
+Service. Access it through a pod port-forward:
+
+```sh
+kubectl -n ate-system port-forward deployment/atenet-router 4040:4040
+```
+
+Open `http://127.0.0.1:4040/statusz` (or add `?format=json`). Binding
+`--status-address` to a non-loopback address exposes the diagnostic data to
+other pods.
+
+Contents:
+
+* Global flags values
+* Command line args
+* Last 100 queries served
+* Build tag
+
+Health checks use `/healthz` (liveness) and `/readyz` (readiness) on the health
+listener, configured by `--health-listen-addr` (default `:9091`). For a GKE
+Gateway, migrate any `HealthCheckPolicy` using port 4040 and `/statusz` to port
+9091 and `/readyz`, so draining pods also stop receiving traffic.
+[GKE probes Pod IPs directly](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/configure-gateway-resources#configure_health_checks),
+so port 9091 does not need to be published by the router Service.

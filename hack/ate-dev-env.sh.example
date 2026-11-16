@@ -1,0 +1,50 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Example environment for Substrate development on a local kind cluster.
+# Copy this file to .ate-dev-env.sh, adjust it, and source it in every shell
+# that runs ate-setup or the hack/ scripts:
+#
+#   cp hack/ate-dev-env.sh.example .ate-dev-env.sh
+#   source .ate-dev-env.sh
+#   hack/create-kind-cluster.sh
+#   go run ./cmd/ate-setup deploy ate-system
+#
+# On kind, ate-setup does not read .ate-dev-env.sh itself, so source it into
+# your shell. Every value keeps one already exported, so you can override any
+# of them per shell.
+
+# Target the local kind cluster.
+export ATE_INSTALL_KIND="${ATE_INSTALL_KIND:-true}"
+# kind cluster name used by hack/create-kind-cluster.sh,
+# hack/delete-kind-cluster.sh and ate-setup (kube context kind-<name>).
+export KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+# Local registry hack/create-kind-cluster.sh starts; ko pushes images here.
+export KIND_REGISTRY_PORT="${KIND_REGISTRY_PORT:-5001}"
+export KO_DOCKER_REPO="${KO_DOCKER_REPO:-localhost:${KIND_REGISTRY_PORT}}"
+# IP family of the kind cluster: ipv4, dual or ipv6.
+# export IP_FAMILY=ipv4
+
+# Credential provider the egress gateway injects credentials from, as JSON; the
+# install requires a choice. {"name":"k8s.io"} deploys the bundled Kubernetes
+# Secrets provider, with a NetworkPolicy that admits only the egress gateway;
+# {"enabled":false} turns egress credential injection off, and is the only choice
+# on the agentgateway dataplane; {"name":"<provider>","address":"<host>:<port>"}
+# uses a provider you deploy yourself. See docs/guides/egress-credential-injection.md.
+export ATE_CREDENTIAL_PROVIDER="${ATE_CREDENTIAL_PROVIDER:-{\"name\":\"k8s.io\"}}"
+
+# Clients the ingress router lets reach actors, comma-separated. This is the
+# identity `kubectl ate proxy actor` presents. See
+# docs/guides/operator-install.md#ingress-to-actors.
+export ATE_INGRESS_ALLOWED_SPIFFE_IDS="${ATE_INGRESS_ALLOWED_SPIFFE_IDS:-spiffe://cluster.local/ns/ate-system/sa/atenet-client}"

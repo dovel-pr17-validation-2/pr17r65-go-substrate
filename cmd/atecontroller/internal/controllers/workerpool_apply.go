@@ -1,0 +1,698 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controllers
+
+import (
+	"slices"
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	"go.ate.dev/substrate/internal/deviceplugin"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/workercapacity"
+)
+
+// workerOTelResourceAttributes mirrors atelet.yaml; service.instance.id is the pod
+// uid so each worker pod is a distinct telemetry source.
+const workerOTelResourceAttributes = "k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)"
+
+// workerTerminationGracePeriodSeconds is the hardcoded pod termination grace
+// period for worker pods (60 minutes).
+const workerTerminationGracePeriodSeconds int64 = 3600
+
+// Rollout settings for the pool's Deployment. A pool edit rolls the workers
+// through the eviction path, so the strategy is chosen for the actors on them:
+//
+//   - maxSurge 0 with a 10% maxUnavailable, which Kubernetes raises to at
+//     least one pod. To make the roll smooth, make it gradual, maxSurge should
+//     be 0 to avoid any potential stall for small size WorkerPool.
+//   - progressDeadlineSeconds above the 3600s pod grace period, with room for
+//     the replacement to start, so a batch waiting out the drain does not have
+//     kubectl rollout status report a failed rollout.
+const (
+	workerRolloutMaxSurge                = 0
+	workerRolloutMaxUnavailable          = "10%"
+	workerRolloutProgressDeadlineSeconds = int32(4800)
+)
+
+// workerOTelSettings is the telemetry configuration propagated to worker
+// pods. A zero value sets only the worker's resource identity.
+type workerOTelSettings struct {
+	// Endpoint is the OTLP collector address the worker exports to directly, when it
+	// finds no atelet relay. Empty leaves the worker exporting through the relay
+	// only, and exporting nothing without one.
+	Endpoint string
+	// MetricExportInterval overrides the SDK's 60s PeriodicReader interval. It is
+	// the raw OTEL_METRIC_EXPORT_INTERVAL value, i.e. whole milliseconds; the SDK
+	// falls back to its default when it does not parse. Empty keeps the default.
+	//
+	// worker registers no instruments of its own, so its only telemetry is
+	// otelgrpc's rpc.server.* and it stays invisible to the collector until the
+	// first export tick fires. Shortening the interval is what keeps that
+	// startup gap inside an e2e budget; production leaves it unset.
+	MetricExportInterval string
+	// MetricExportTimeout overrides the SDK's  per-export timeout, in the same
+	// whole-millisecond form as MetricExportInterval. Empty keeps the default.
+	MetricExportTimeout string
+	// TracesSampler and TracesSamplerArg are the raw OTEL_TRACES_SAMPLER and
+	// OTEL_TRACES_SAMPLER_ARG values, passed through untouched: worker's own
+	// serverboot resolution validates them. Empty sampler keeps the worker's
+	// default and drops the arg, which is dead config on its own.
+	TracesSampler    string
+	TracesSamplerArg string
+	// LogsExporter, TracesExporter and MetricsExporter are the
+	// OTEL_LOGS_EXPORTER, OTEL_TRACES_EXPORTER and OTEL_METRICS_EXPORTER set on
+	// the worker, passed through untouched. They are worker-only values rather than
+	// the controller's own: on the control plane, metrics prometheus means
+	// scraped instead of pushed, and ateworker serves no /metrics. Empty keeps
+	// ateworker's defaults: none for logs, otlp for traces and metrics.
+	LogsExporter    string
+	TracesExporter  string
+	MetricsExporter string
+}
+
+// workerPoolLabel names the WorkerPool on each of its worker pods.
+const workerPoolLabel = "ate.dev/worker-pool"
+
+const (
+	atunnelIdentityVolume       = "atunnel-identity"
+	atunnelIdentityMountPath    = "/run/podidentity.podcert.ate.dev"
+	atunnelEgressTrustVolume    = "atunnel-egress-trust"
+	atunnelEgressTrustMountPath = "/run/servicedns.podcert.ate.dev"
+	workerCapacityVolume        = "worker-capacity"
+)
+
+// buildDeploymentApplyConfig constructs the SSA apply configuration for the
+// Deployment managed by a WorkerPool. Only fields owned by this controller
+// are declared here. otel is propagated to the worker container (see
+// workerContainerEnv).
+func buildDeploymentApplyConfig(wp *atev1.WorkerPool, otel workerOTelSettings, systemNamespace, ateletServiceAccount, routerServiceAccount, dnsEgressPolicy string) *appsv1ac.DeploymentApplyConfiguration {
+	labels := map[string]string{}
+	annotations := map[string]string{}
+	if wp.Spec.Template != nil {
+		for key, value := range wp.Spec.Template.Labels {
+			labels[key] = string(value)
+		}
+		for key, value := range wp.Spec.Template.Annotations {
+			annotations[key] = value
+		}
+	}
+	labels[workerPoolLabel] = wp.Name
+
+	args := []string{
+		"--pod-uid=$(POD_UID)",
+		"--pod-ips=$(POD_IPS)",
+		"--atunnel-listen-address=:443",
+		"--atunnel-connect-listen-address=:8443",
+		"--atunnel-credential-bundle=" + atunnelIdentityMountPath + "/credential-bundle.pem",
+		"--atunnel-trust-bundle=" + atunnelIdentityMountPath + "/trust-bundle.pem",
+		// The peers atunnel authenticates live in substrate's namespace, not
+		// the worker's, so the controller passes their identities rather than
+		// letting worker assume the default install. --atunnel-client-identity
+		// has been accepted by every worker that carries this controller's
+		// contemporaries, so it is always safe to pass.
+		"--atunnel-client-identity=" + installdefaults.SPIFFEID(systemNamespace, routerServiceAccount),
+	}
+
+	// --atunnel-broker-identity is newer than the oldest worker a WorkerPool
+	// may still pin, and a worker exits on an unrecognized flag. A worker
+	// without the flag hardcodes the canonical identity, and a worker with it
+	// defaults to the same, so omitting the flag when it carries that value is
+	// equivalent for both. A relocated or renamed install passes something
+	// else and needs an image new enough to accept it, which it necessarily
+	// has.
+	if brokerIdentity := installdefaults.SPIFFEID(systemNamespace, ateletServiceAccount); brokerIdentity != installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace) {
+		args = append(args, "--atunnel-broker-identity="+brokerIdentity)
+	}
+
+	args = append(args,
+		"--atunnel-egress-listen-address=0.0.0.0:15001",
+		"--atunnel-egress-trust-bundle="+atunnelEgressTrustMountPath+"/trust-bundle.pem",
+		"--dns-egress-policy="+dnsEgressPolicy,
+	)
+
+	// worker gets preview features when the controller has them.
+	enabledGates := func() []string {
+		ret := []string{}
+		for k, v := range preview.AsMap() {
+			if v {
+				ret = append(ret, k)
+			}
+		}
+		// Map order is random; a stable arg avoids needless rollouts.
+		slices.Sort(ret)
+		return ret
+	}
+	previewArg := "--preview=" + strings.Join(enabledGates(), ",")
+	args = append(args, previewArg)
+
+	containerAC := corev1ac.Container().
+		WithName("worker").
+		WithImage(wp.Spec.WorkerImage).
+		WithArgs(args...).
+		WithPorts(corev1ac.ContainerPort().
+			WithName("https").
+			WithContainerPort(443).
+			WithProtocol(corev1.ProtocolTCP),
+			corev1ac.ContainerPort().
+				WithName("connect").
+				WithContainerPort(8443).
+				WithProtocol(corev1.ProtocolTCP),
+			corev1ac.ContainerPort().
+				WithName("readyz").
+				WithContainerPort(8080).
+				WithProtocol(corev1.ProtocolTCP)).
+		WithReadinessProbe(corev1ac.Probe().
+			WithHTTPGet(corev1ac.HTTPGetAction().
+				WithPath("/readyz").
+				WithPort(intstr.FromString("readyz")))).
+		WithSecurityContext(workerSecurityContext(wp.Spec.DefaultSandboxClass())).
+		WithEnv(workerContainerEnv(otel)...).
+		WithVolumeMounts(
+			corev1ac.VolumeMount().
+				WithName(workerCapacityVolume).
+				WithMountPath(workercapacity.MountPath).
+				WithReadOnly(true),
+			corev1ac.VolumeMount().
+				WithName("ate-base").
+				WithMountPath(nodepath.BasePath).
+				WithMountPropagation(corev1.MountPropagationHostToContainer),
+			corev1ac.VolumeMount().
+				WithName(atunnelIdentityVolume).
+				WithMountPath(atunnelIdentityMountPath).
+				WithReadOnly(true),
+			corev1ac.VolumeMount().
+				WithName(atunnelEgressTrustVolume).
+				WithMountPath(atunnelEgressTrustMountPath).
+				WithReadOnly(true),
+		)
+
+	podSpecAC := corev1ac.PodSpec().
+		WithSecurityContext(corev1ac.PodSecurityContext().
+			WithRunAsUser(0).
+			WithRunAsGroup(0)).
+		WithVolumes(
+			corev1ac.Volume().
+				WithName(workerCapacityVolume).
+				WithDownwardAPI(corev1ac.DownwardAPIVolumeSource().
+					WithItems(
+						resourceFieldRefFile(workercapacity.CPULimitFile, "limits.cpu", milliCores),
+						resourceFieldRefFile(workercapacity.MemoryLimitFile, "limits.memory", wholeBytes),
+					)),
+			corev1ac.Volume().
+				WithName("ate-base").
+				WithHostPath(corev1ac.HostPathVolumeSource().
+					WithPath(nodepath.BasePath).
+					WithType(corev1.HostPathDirectoryOrCreate)),
+			corev1ac.Volume().
+				WithName(atunnelIdentityVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithPodCertificate(corev1ac.PodCertificateProjection().
+								WithSignerName("podidentity.podcert.ate.dev/identity").
+								WithKeyType("ECDSAP256").
+								WithCredentialBundlePath("credential-bundle.pem")),
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName("podidentity.podcert.ate.dev/identity").
+								WithLabelSelector(metav1ac.LabelSelector().
+									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
+								WithPath("trust-bundle.pem")),
+					),
+				),
+			corev1ac.Volume().
+				WithName(atunnelEgressTrustVolume).
+				WithProjected(corev1ac.ProjectedVolumeSource().
+					WithSources(
+						corev1ac.VolumeProjection().
+							WithClusterTrustBundle(corev1ac.ClusterTrustBundleProjection().
+								WithSignerName("servicedns.podcert.ate.dev/identity").
+								WithLabelSelector(metav1ac.LabelSelector().
+									WithMatchLabels(map[string]string{"podcert.ate.dev/canarying": "live"})).
+								WithPath("trust-bundle.pem")),
+					),
+				),
+		)
+
+	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
+	applySandboxClassToleration(podSpecAC, wp.Spec.DefaultSandboxClass())
+	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.DefaultSandboxClass())
+	podSpecAC.WithContainers(containerAC)
+	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
+
+	return appsv1ac.Deployment(wp.Name, wp.Namespace).
+		WithLabels(labels).
+		WithAnnotations(annotations).
+		WithOwnerReferences(metav1ac.OwnerReference().
+			WithAPIVersion(atev1.GroupVersion.String()).
+			WithKind("WorkerPool").
+			WithName(wp.Name).
+			WithUID(wp.UID).
+			WithController(true).
+			WithBlockOwnerDeletion(true)).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(wp.Spec.Replicas).
+			WithStrategy(appsv1ac.DeploymentStrategy().
+				WithType(appsv1.RollingUpdateDeploymentStrategyType).
+				WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+					WithMaxSurge(intstr.FromInt32(workerRolloutMaxSurge)).
+					WithMaxUnavailable(intstr.FromString(workerRolloutMaxUnavailable)))).
+			WithProgressDeadlineSeconds(workerRolloutProgressDeadlineSeconds).
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{workerPoolLabel: wp.Name})).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(labels).
+				WithAnnotations(annotations).
+				WithSpec(podSpecAC)))
+}
+
+// workerContainerEnv always sets the resource identity, since the worker
+// exports through atelet's relay whenever atelet has a collector, and adds the
+// OTLP endpoint only when one is configured. Every ref precedes
+// OTEL_RESOURCE_ATTRIBUTES so its $(...) substitutions resolve.
+func workerContainerEnv(otel workerOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
+	// The pool pair also labels every usage record. A worker pod runs in its
+	// WorkerPool's namespace.
+	envs := []*corev1ac.EnvVarApplyConfiguration{
+		fieldRefEnv("POD_UID", "metadata.uid"),
+		fieldRefEnv("POD_NAMESPACE", "metadata.namespace"),
+		fieldRefEnv("WORKER_POOL_NAME", "metadata.labels['"+workerPoolLabel+"']"),
+		fieldRefEnv("POD_NAME", "metadata.name"),
+		fieldRefEnv("NODE_NAME", "spec.nodeName"),
+		// Resolved when the container starts, so a worker process started in a
+		// recreated pod sandbox registers the sandbox's new IPs.
+		fieldRefEnv("POD_IPS", "status.podIPs"),
+	}
+	if otel.Endpoint != "" {
+		envs = append(envs, corev1ac.EnvVar().WithName("OTEL_EXPORTER_OTLP_ENDPOINT").WithValue(otel.Endpoint))
+	}
+	envs = append(envs, corev1ac.EnvVar().WithName("OTEL_RESOURCE_ATTRIBUTES").WithValue(workerOTelResourceAttributes))
+	if otel.MetricExportInterval != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_METRIC_EXPORT_INTERVAL").
+			WithValue(otel.MetricExportInterval))
+	}
+	if otel.MetricExportTimeout != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_METRIC_EXPORT_TIMEOUT").
+			WithValue(otel.MetricExportTimeout))
+	}
+	if otel.LogsExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_LOGS_EXPORTER").
+			WithValue(otel.LogsExporter))
+	}
+	if otel.TracesSampler != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_TRACES_SAMPLER").
+			WithValue(otel.TracesSampler))
+		if otel.TracesSamplerArg != "" {
+			envs = append(envs, corev1ac.EnvVar().
+				WithName("OTEL_TRACES_SAMPLER_ARG").
+				WithValue(otel.TracesSamplerArg))
+		}
+	}
+	if otel.TracesExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_TRACES_EXPORTER").
+			WithValue(otel.TracesExporter))
+	}
+	if otel.MetricsExporter != "" {
+		envs = append(envs, corev1ac.EnvVar().
+			WithName("OTEL_METRICS_EXPORTER").
+			WithValue(otel.MetricsExporter))
+	}
+	return envs
+}
+
+// Divisors for resourceFieldRefFile. The downward API reports
+// ceil(limit/divisor), so these are the units the value arrives in; the default
+// divisor of one core would round a fractional CPU limit up to a whole one.
+const (
+	milliCores = "1m"
+	wholeBytes = "1"
+)
+
+// resourceFieldRefFile projects a container resource in units of divisor.
+func resourceFieldRefFile(path, resourceName, divisor string) *corev1ac.DownwardAPIVolumeFileApplyConfiguration {
+	return corev1ac.DownwardAPIVolumeFile().
+		WithPath(path).
+		WithResourceFieldRef(corev1ac.ResourceFieldSelector().
+			WithContainerName("worker").
+			WithResource(resourceName).
+			WithDivisor(resource.MustParse(divisor)))
+}
+
+func fieldRefEnv(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
+	return corev1ac.EnvVar().
+		WithName(name).
+		WithValueFrom(corev1ac.EnvVarSource().
+			WithFieldRef(corev1ac.ObjectFieldSelector().
+				WithFieldPath(fieldPath)))
+}
+
+// workerGvisorCapabilities is the fixed capability set for gVisor workers.
+// runsc's gofer maps a full-range identity in a user namespace
+// (SETUID/SETGID, plus SETFCAP: since Linux 5.12, writing a uid_map that maps
+// uid 0 needs CAP_SETFCAP over the parent user namespace, and without it the
+// gofer fails with "cannot create gofer process: fork/exec /proc/self/exe:
+// operation not permitted"), worker mounts need SYS_ADMIN, actor networking
+// needs NET_ADMIN/NET_RAW, and rootfs ownership and modes need
+// DAC_OVERRIDE/FOWNER/CHOWN.
+//
+// The sandbox's user namespace supplies its own SYS_CHROOT (gofer) and
+// SYS_PTRACE (systrap); the outer worker needs neither, nor SETPCAP. That user
+// namespace comes from runsc's modifySpecForDirectfs, which creates an
+// identity-mapped userns only while directfs is on and --network is not host.
+// Both hold with the runsc flags in cmd/ateworker-gvisor/kodata/internal_flags.json;
+// setting --directfs=false or --network=host there moves the gofer and systrap
+// back into the worker's userns, where runsc only logs that it drops the
+// missing capabilities. Since Linux 5.8, creating the 0:0 overlay whiteouts
+// does not require MKNOD.
+var workerGvisorCapabilities = []corev1.Capability{
+	"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE",
+	"FOWNER", "CHOWN", "NET_RAW", "SETFCAP",
+}
+
+// workerMicroVMCapabilities retains virtiofsd's eight default child
+// capabilities, plus NET_ADMIN and SYS_ADMIN for worker networking and mounts.
+// MKNOD and FSETID preserve guest device-node creation and setgid files.
+// DAC_READ_SEARCH is not granted: virtiofsd only adds it to its child set to
+// open file handles, and virtiofsdArgs in cmd/ateworker-microvm/internal/kata
+// turns file handles off. Unlike gVisor, this runtime does not need NET_RAW.
+//
+// SETPCAP stays because virtiofsd's serving child drops its bounding set with
+// PR_CAPBSET_DROP, which libcap-ng only issues while CAP_SETPCAP is effective.
+// Without it the child keeps the worker's full bounding set, and a virtiofsd
+// built against unpatched libcap-ng (>= 0.8.1) refuses to start. Granting it
+// adds nothing reachable: the worker's permitted set already equals its
+// bounding set.
+//
+// The hypervisor devices are not capabilities: they come from atelet's device
+// plugin (see maybeApplyMicroVMPodShape).
+var workerMicroVMCapabilities = []corev1.Capability{
+	"NET_ADMIN", "SYS_ADMIN", "SETUID", "SETGID", "DAC_OVERRIDE",
+	"FOWNER", "CHOWN", "MKNOD", "SETFCAP", "FSETID", "SETPCAP",
+}
+
+// workerSecurityContext returns the worker container security context for a sandbox
+// class. Neither class runs privileged; they differ in their capability set.
+// Both declare seccomp Unconfined because their sandbox child pivot_root()s,
+// which the default profile denies. An empty class defaults to gVisor.
+func workerSecurityContext(class atev1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
+	// Both runtimes mount inside the worker — runsc pivots root and the worker
+	// remounts /sys/fs/cgroup to nest per-actor cgroups; the micro-VM worker
+	// shares /run/kata-containers and remounts /proc/sys — and the default
+	// AppArmor profile denies mount (enforced on GKE COS and Ubuntu, a no-op on
+	// nodes that do not load AppArmor). A privileged worker got this implicitly;
+	// unprivileged must request it. Replacing Unconfined with a tailored profile
+	// per runtime is a follow-up.
+	sc := corev1ac.SecurityContext().
+		WithRunAsUser(0).
+		WithRunAsGroup(0).
+		WithPrivileged(false).
+		WithAllowPrivilegeEscalation(false).
+		WithAppArmorProfile(corev1ac.AppArmorProfile().
+			WithType(corev1.AppArmorProfileTypeUnconfined))
+
+	if class == atev1.SandboxClassMicroVM {
+		// Give up the default seccomp profile so virtiofsd keeps its own sandbox,
+		// which pivot_root()s — a syscall the profile denies whatever capabilities
+		// the worker holds. The trade favors containing the guest: virtiofsd parses
+		// requests from it, so its namespaces are part of the guest-to-host
+		// boundary, while the pod-wide profile mostly confines worker, which we
+		// trust. Both guest-facing processes confine themselves anyway, virtiofsd
+		// with its own seccomp filter and eight capabilities, cloud-hypervisor with
+		// per-thread filters.
+		return sc.
+			WithCapabilities(corev1ac.Capabilities().
+				WithDrop("ALL").
+				WithAdd(workerMicroVMCapabilities...)).
+			WithSeccompProfile(corev1ac.SeccompProfile().
+				WithType(corev1.SeccompProfileTypeUnconfined))
+	}
+	// runsc's sandbox child also pivot_root()s, so it needs the same relaxation:
+	// a cluster that defaults seccomp to RuntimeDefault denies the syscall whatever
+	// capabilities the worker holds, and the sandbox then dies during startup.
+	// Declare Unconfined explicitly so the worker does not depend on the cluster
+	// leaving the profile unset.
+	return sc.
+		WithCapabilities(corev1ac.Capabilities().
+			WithDrop("ALL").
+			WithAdd(workerGvisorCapabilities...)).
+		WithSeccompProfile(corev1ac.SeccompProfile().
+			WithType(corev1.SeccompProfileTypeUnconfined))
+}
+
+// maybeApplyMicroVMPodShape adds the /dev/kvm device and node placement a
+// micro-VM (kata + cloud-hypervisor) worker pool needs, on top of any
+// pod-template settings. No-op unless sandboxClass is the micro-VM class.
+//
+// TODO: this hardcodes one sandbox class's pod requirements in the controller.
+// Consider making it generic so a sandbox class can declare its own pod shape
+// (e.g. required devices/mounts + node placement on the SandboxConfig spec)
+// instead of branching on SandboxClass here, so new classes don't need a
+// controller change.
+func maybeApplyMicroVMPodShape(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	containerAC *corev1ac.ContainerApplyConfiguration,
+	sandboxClass atev1.SandboxClass,
+) {
+	if sandboxClass != atev1.SandboxClassMicroVM {
+		return
+	}
+
+	// The micro-VM runtime needs /dev/kvm to create the VM. Request it as an
+	// extended resource served by atelet's device plugin rather than
+	// hostPath-mounting it: a container's device access is gated by the cgroup
+	// device controller, which denies /dev/kvm by default, and kubelet's device
+	// manager is what adds the matching allow rule. A hostPath mount alone
+	// yields EPERM unless the pod is privileged, which would hand over every
+	// other device on the node too.
+	//
+	// atelet advertises it only on nodes where the device exists, so the
+	// request also keeps the pod off nodes that cannot run a micro-VM.
+	addDeviceResourceLimits(containerAC, deviceplugin.ResourceKVM)
+
+	// The runtime also opens /dev/net/tun to build the guest's tap, but that
+	// one needs no grant: it is in the runtime's default device allow-list, so
+	// a bind mount is enough and creating the tap is a capability question
+	// (CAP_NET_ADMIN, above) rather than a device one. That default is a
+	// compatibility guarantee rather than an accident — runc dropped the rule
+	// once, restored it when it broke users, and crun matched.
+	//
+	// Advertising tun as a resource would only add a placement constraint that
+	// can fail: it is not scarce, and a node where the tun module has yet to
+	// load would refuse a worker that needs nothing from it.
+	containerAC.WithVolumeMounts(corev1ac.VolumeMount().
+		WithName(tunDeviceVolume).
+		WithMountPath(tunDevicePath))
+	podSpecAC.WithVolumes(corev1ac.Volume().
+		WithName(tunDeviceVolume).
+		WithHostPath(corev1ac.HostPathVolumeSource().
+			WithPath(tunDevicePath).
+			WithType(corev1.HostPathCharDev)))
+
+	// Placement onto KVM-capable nodes comes from the device request above: the
+	// scheduler only picks nodes advertising the resource, and atelet advertises
+	// it only where the device exists. That is derived from the node itself,
+	// unlike an ate.dev/sandboxClass label, which is a hand-applied convention
+	// that can be wrong in both directions (a labeled node without KVM takes
+	// pods that then fail at runtime; an unlabeled KVM node is invisible
+	// capacity). Note this makes the pool depend on atelet having registered:
+	// with no node advertising the resource, workers stay Pending rather than
+	// landing somewhere they cannot run.
+	//
+	// Extended resources constrain where this pod fits but repel nothing, so a
+	// cluster reserving nested-virt nodes with a taint also needs the toleration
+	// that applySandboxClassToleration adds for every class.
+}
+
+// sandboxClassTaintKey is the taint key a cluster puts on a node pool reserved
+// for one sandbox class, with the class name as the value:
+// ate.dev/sandboxClass=<class>:NoSchedule. The atelet DaemonSet tolerates the
+// key for any value.
+const sandboxClassTaintKey = "ate.dev/sandboxClass"
+
+// applySandboxClassToleration lets worker pods schedule onto a node pool
+// tainted for the pool's own sandbox class. Without it a cluster that reserves
+// nodes per class with the ate.dev/sandboxClass taint leaves every worker
+// Pending. The toleration is additive on top of the WorkerPool's configurable
+// spec.template tolerations. An empty class means the API default, gvisor,
+// which is what the CRD's defaulting produces on the server.
+func applySandboxClassToleration(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	sandboxClass atev1.SandboxClass,
+) {
+	if sandboxClass == "" {
+		sandboxClass = atev1.SandboxClassGvisor
+	}
+	podSpecAC.WithTolerations(corev1ac.Toleration().
+		WithKey(sandboxClassTaintKey).
+		WithOperator(corev1.TolerationOpEqual).
+		WithValue(string(sandboxClass)).
+		WithEffect(corev1.TaintEffectNoSchedule))
+}
+
+// The tun device node a micro-VM worker bind-mounts to build the guest's tap.
+const (
+	tunDeviceVolume = "dev-net-tun"
+	tunDevicePath   = "/dev/net/tun"
+)
+
+// addDeviceResourceLimits requests one unit of each named extended resource,
+// merging into whatever limits the pod template already set.
+func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, resourceNames ...string) {
+	if containerAC.Resources == nil {
+		containerAC.WithResources(corev1ac.ResourceRequirements())
+	}
+	limits := corev1.ResourceList{}
+	if containerAC.Resources.Limits != nil {
+		limits = *containerAC.Resources.Limits
+	}
+	for _, name := range resourceNames {
+		limits[corev1.ResourceName(name)] = resource.MustParse("1")
+	}
+	containerAC.Resources.WithLimits(limits)
+}
+
+func applyWorkerPoolPodTemplate(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	containerAC *corev1ac.ContainerApplyConfiguration,
+	tmpl *atev1.WorkerPoolPodTemplate,
+) {
+	podSpecAC.NodeSelector = map[string]string{}
+	podSpecAC.Tolerations = []corev1ac.TolerationApplyConfiguration{}
+	podSpecAC.WithPriorityClassName("")
+	podSpecAC.WithServiceAccountName(installdefaults.WorkerServiceAccount)
+	podSpecAC.WithAffinity(corev1ac.Affinity())
+	resourcesAC := corev1ac.ResourceRequirements()
+	containerAC.WithResources(resourcesAC)
+
+	if tmpl == nil {
+		return
+	}
+
+	if tmpl.NodeSelector != nil {
+		podSpecAC.WithNodeSelector(tmpl.NodeSelector)
+	}
+	podSpecAC.Tolerations = tolerationApplyValues(tolerationsToApply(tmpl.Tolerations))
+	podSpecAC.WithPriorityClassName(tmpl.PriorityClassName)
+	if tmpl.ServiceAccountName != nil {
+		podSpecAC.WithServiceAccountName(*tmpl.ServiceAccountName)
+	}
+
+	if tmpl.NodeAffinity != nil {
+		podSpecAC.WithAffinity(corev1ac.Affinity().WithNodeAffinity(nodeAffinityToApply(tmpl.NodeAffinity)))
+	}
+
+	if tmpl.Resources != nil {
+		if tmpl.Resources.Requests != nil {
+			resourcesAC.WithRequests(tmpl.Resources.Requests)
+		}
+		if tmpl.Resources.Limits != nil {
+			resourcesAC.WithLimits(tmpl.Resources.Limits)
+		}
+	}
+}
+
+func tolerationApplyValues(tolerations []*corev1ac.TolerationApplyConfiguration) []corev1ac.TolerationApplyConfiguration {
+	out := make([]corev1ac.TolerationApplyConfiguration, 0, len(tolerations))
+	for _, toleration := range tolerations {
+		out = append(out, *toleration)
+	}
+	return out
+}
+
+func tolerationsToApply(tolerations []corev1.Toleration) []*corev1ac.TolerationApplyConfiguration {
+	out := make([]*corev1ac.TolerationApplyConfiguration, 0, len(tolerations))
+	for i := range tolerations {
+		t := &tolerations[i]
+		ac := corev1ac.Toleration()
+		if t.Key != "" {
+			ac.WithKey(t.Key)
+		}
+		if t.Operator != "" {
+			ac.WithOperator(t.Operator)
+		}
+		if t.Value != "" {
+			ac.WithValue(t.Value)
+		}
+		if t.Effect != "" {
+			ac.WithEffect(t.Effect)
+		}
+		if t.TolerationSeconds != nil {
+			ac.WithTolerationSeconds(*t.TolerationSeconds)
+		}
+		out = append(out, ac)
+	}
+	return out
+}
+
+func nodeAffinityToApply(na *corev1.NodeAffinity) *corev1ac.NodeAffinityApplyConfiguration {
+	ac := corev1ac.NodeAffinity()
+	if na.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		ac.WithRequiredDuringSchedulingIgnoredDuringExecution(nodeSelectorToApply(na.RequiredDuringSchedulingIgnoredDuringExecution))
+	}
+	for i := range na.PreferredDuringSchedulingIgnoredDuringExecution {
+		term := &na.PreferredDuringSchedulingIgnoredDuringExecution[i]
+		ac.WithPreferredDuringSchedulingIgnoredDuringExecution(preferredSchedulingTermToApply(term))
+	}
+	return ac
+}
+
+func nodeSelectorToApply(ns *corev1.NodeSelector) *corev1ac.NodeSelectorApplyConfiguration {
+	ac := corev1ac.NodeSelector()
+	for i := range ns.NodeSelectorTerms {
+		ac.WithNodeSelectorTerms(nodeSelectorTermToApply(&ns.NodeSelectorTerms[i]))
+	}
+	return ac
+}
+
+func preferredSchedulingTermToApply(term *corev1.PreferredSchedulingTerm) *corev1ac.PreferredSchedulingTermApplyConfiguration {
+	return corev1ac.PreferredSchedulingTerm().
+		WithWeight(term.Weight).
+		WithPreference(nodeSelectorTermToApply(&term.Preference))
+}
+
+func nodeSelectorTermToApply(term *corev1.NodeSelectorTerm) *corev1ac.NodeSelectorTermApplyConfiguration {
+	ac := corev1ac.NodeSelectorTerm()
+	for i := range term.MatchExpressions {
+		ac.WithMatchExpressions(nodeSelectorRequirementToApply(&term.MatchExpressions[i]))
+	}
+	for i := range term.MatchFields {
+		ac.WithMatchFields(nodeSelectorRequirementToApply(&term.MatchFields[i]))
+	}
+	return ac
+}
+
+func nodeSelectorRequirementToApply(req *corev1.NodeSelectorRequirement) *corev1ac.NodeSelectorRequirementApplyConfiguration {
+	ac := corev1ac.NodeSelectorRequirement().WithKey(req.Key).WithOperator(req.Operator)
+	if len(req.Values) > 0 {
+		ac.WithValues(req.Values...)
+	}
+	return ac
+}

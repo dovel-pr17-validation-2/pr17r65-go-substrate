@@ -1,0 +1,161 @@
+// Copyright 2026 The Agent Substrate Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package controlapi
+
+import (
+	"testing"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestActorEgressPolicy(t *testing.T) {
+	persistence, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+	service := &RPCService{impl: &ServiceImpl{store: persistence}}
+	if _, err := persistence.CreateAtespace(t.Context(), &ateapi.Atespace{
+		Metadata: &ateapi.ResourceMetadata{Name: testAtespace},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := persistence.CreateActor(t.Context(), &ateapi.Actor{
+		Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "egress-actor"},
+		Status:   &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_RUNNING},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actorRef := &ateapi.ObjectRef{Atespace: testAtespace, Name: "egress-actor"}
+
+	if _, err := service.GetActorEgressPolicy(t.Context(), &ateapi.GetActorEgressPolicyRequest{
+		Actor: actorRef,
+		Name:  resources.SingletonName,
+	}); apierror.Code(err) != codes.NotFound {
+		t.Fatalf("policy before create status = %v, want NotFound", apierror.Code(err))
+	}
+	if _, err := service.GetActorEgressPolicy(t.Context(), &ateapi.GetActorEgressPolicyRequest{
+		Actor: &ateapi.ObjectRef{Atespace: testAtespace, Name: "missing-actor"},
+		Name:  resources.SingletonName,
+	}); apierror.Code(err) != codes.NotFound {
+		t.Fatalf("missing parent status = %v, want NotFound", apierror.Code(err))
+	}
+	created, err := service.CreateActorEgressPolicy(t.Context(), &ateapi.CreateActorEgressPolicyRequest{
+		Actor: actorRef,
+		EgressPolicy: &ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{
+				Atespace: testAtespace,
+				Name:     "default",
+				Uid:      "ignored",
+				Version:  99,
+			}, Rules: []*ateapi.EgressRule{{
+				Http: &ateapi.HttpRule{
+					Hostnames: []string{"api.example.com"},
+					Effects: &ateapi.HttpRuleEffects{
+						ReplaceHeaders: []*ateapi.CredentialHeader{{
+							Header:        "Authorization",
+							Prefix:        "Bearer ",
+							CredentialUri: "ate-secret://kubernetes.io/provider/ns/name",
+						}},
+					},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateActorEgressPolicy(t.Context(), &ateapi.CreateActorEgressPolicyRequest{
+		Actor: actorRef,
+		EgressPolicy: &ateapi.EgressPolicy{
+			Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "default"},
+		},
+	}); apierror.Code(err) != codes.AlreadyExists {
+		t.Fatalf("create collision status = %v, want AlreadyExists", apierror.Code(err))
+	}
+	if created.GetRules()[0].GetHttp().GetEffects().GetReplaceHeaders()[0].GetHeader() != "Authorization" {
+		t.Fatalf("policy input was rewritten: %v", created)
+	}
+	if md := created.GetMetadata(); md.GetName() != "default" || md.GetAtespace() != testAtespace || md.GetUid() == "" || md.GetVersion() != 1 || md.GetCreateTime() == nil || md.GetUpdateTime() == nil {
+		t.Fatalf("created metadata = %v", md)
+	}
+	got, err := service.GetActorEgressPolicy(t.Context(), &ateapi.GetActorEgressPolicyRequest{Actor: actorRef, Name: resources.SingletonName})
+	if err != nil || !proto.Equal(got, created) {
+		t.Fatalf("policy after create = %v, %v; want %v", got, err, created)
+	}
+	if _, err := service.impl.UpdateEgressPolicy(t.Context(), resources.ActorRefFromObjectRef(actorRef), store.PreconditionFrom(created), func(policy *ateapi.EgressPolicy) error {
+		policy.Rules[0].Http.Hostnames = nil
+		return nil
+	}); apierror.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid internal update status = %v, want InvalidArgument", apierror.Code(err))
+	}
+	replacement := proto.Clone(created).(*ateapi.EgressPolicy)
+	replacement.Rules = nil
+	missingPreconditions := proto.Clone(replacement).(*ateapi.EgressPolicy)
+	missingPreconditions.Metadata.Uid = ""
+	missingPreconditions.Metadata.Version = 0
+	if _, err := service.UpdateActorEgressPolicy(t.Context(), &ateapi.UpdateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: missingPreconditions,
+	}); apierror.Code(err) != codes.InvalidArgument {
+		t.Fatalf("missing preconditions status = %v, want InvalidArgument", apierror.Code(err))
+	}
+	changedIdentity := proto.Clone(replacement).(*ateapi.EgressPolicy)
+	changedIdentity.Metadata.Atespace = "other"
+	changedIdentity.Metadata.Name = "other"
+	if _, err := service.UpdateActorEgressPolicy(t.Context(), &ateapi.UpdateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: changedIdentity,
+	}); apierror.Code(err) != codes.InvalidArgument {
+		t.Fatalf("changed identity status = %v, want InvalidArgument", apierror.Code(err))
+	}
+	updated, err := service.UpdateActorEgressPolicy(t.Context(), &ateapi.UpdateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: replacement,
+	})
+	if err != nil || updated.GetMetadata().GetVersion() != 2 || len(updated.GetRules()) != 0 {
+		t.Fatalf("replacement = %v, %v; want empty version 2", updated, err)
+	}
+	if _, err := service.UpdateActorEgressPolicy(t.Context(), &ateapi.UpdateActorEgressPolicyRequest{
+		Actor:        actorRef,
+		EgressPolicy: replacement,
+	}); apierror.Code(err) != codes.Aborted {
+		t.Fatalf("stale replacement status = %v, want Aborted", apierror.Code(err))
+	}
+	deleted, err := service.DeleteActorEgressPolicy(t.Context(), &ateapi.DeleteActorEgressPolicyRequest{
+		Actor: actorRef,
+		Name:  resources.SingletonName,
+	})
+	if err != nil {
+		t.Fatalf("DeleteActorEgressPolicy: %v", err)
+	}
+	if deleted.GetMetadata().GetDeleteTime() == nil {
+		t.Error("the deleted policy carries no delete_time")
+	}
+	deleted.Metadata.DeleteTime = nil
+	if !proto.Equal(deleted, updated) {
+		t.Fatalf("deleted policy = %v; want %v with delete_time set", deleted, updated)
+	}
+	if _, err := service.GetActorEgressPolicy(t.Context(), &ateapi.GetActorEgressPolicyRequest{
+		Actor: actorRef,
+		Name:  resources.SingletonName,
+	}); apierror.Code(err) != codes.NotFound {
+		t.Fatalf("policy after delete status = %v, want NotFound", apierror.Code(err))
+	}
+}
